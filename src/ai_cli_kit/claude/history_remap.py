@@ -11,7 +11,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tupl
 from ..core.support import atomic_write
 from .models import ExecutionRecord, ExecutionSummary, RunOptions
 from .paths import ClaudePaths
-from .services import _backup_file_copy
+from .services import _backup_file_copy, _ensure_backup_root as _services_ensure_backup_root
 
 DEFAULT_CLAUDE_PROMPT = "Reply with a single word: ok"
 
@@ -104,7 +104,7 @@ def remap_history_identifiers(
                 backup_root = _ensure_backup_root(paths, backup_root, options)
             if backup_root is None:
                 raise RuntimeError("backup root was not created")
-            backup_path = _backup_file_copy(paths.home, backup_root, file_path)
+            backup_path = _backup_file_copy(paths, backup_root, file_path)
         else:
             backup_path = None
 
@@ -184,18 +184,37 @@ def _run_claude_refresh(timeout_seconds: int) -> None:
     if _os.name == "nt" and executable.lower().endswith((".cmd", ".bat")):
         cmd = ["cmd.exe", "/c", executable, "-p", DEFAULT_CLAUDE_PROMPT]
 
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=timeout_seconds,
-    )
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        # R7 pass-5 L3: TimeoutExpired's __str__ embeds the executable
+        # path. Replace with a generic message.
+        raise RuntimeError(
+            "Claude 调用超时（%ds）；请运行 `claude --debug` 单独排查。" % timeout_seconds
+        )
+    except (FileNotFoundError, PermissionError, OSError) as exc:
+        # R7 pass-6 M2: subprocess.run can raise these (Windows .cmd
+        # shim deletion race, exec-perm dropped) with the executable
+        # path in the message. Scrub.
+        raise RuntimeError(
+            "无法启动 Claude（%s）；请运行 `claude --version` 排查 PATH 配置。"
+            % type(exc).__name__
+        )
     if result.returncode != 0:
-        stderr = (result.stderr or "").strip()
-        stdout = (result.stdout or "").strip()
-        detail = stderr or stdout or ("claude exited with code %d" % result.returncode)
-        raise RuntimeError("运行 Claude 生成新标识失败：%s" % detail)
+        # R7 pass-4 H3: cc binary stderr/stdout commonly embeds absolute
+        # paths (config dir, MCP server paths, lockfiles). Don't proxy
+        # the raw text up through our exception chain — it gets emitted
+        # in JSON envelopes. Surface only the exit code.
+        raise RuntimeError(
+            "运行 Claude 生成新标识失败：claude 退出码 %d。请运行 `claude --debug` 单独排查。"
+            % result.returncode
+        )
 
 
 def _load_identifier_snapshot(state_file: Path, statsig_dir: Path) -> IdentifierSnapshot:
@@ -221,13 +240,29 @@ def _load_state_user_id(state_file: Path) -> Optional[str]:
     return None
 
 
+def _safe_glob(directory: Path, pattern: str) -> List[Path]:
+    """``Path.glob`` wrapper tolerant of mid-walk dir removal.
+
+    cc rotates statsig files under ``~/.claude/statsig/``; if cc
+    triggers a rotation while we're enumerating, the underlying
+    ``readdir`` can raise ``OSError(ENOENT)`` partway through. Returning
+    an empty list (rather than letting it escape) keeps the remap pass
+    robust — the worst case is missing one mapping, not aborting the
+    whole run.
+    """
+    try:
+        return sorted(directory.glob(pattern))
+    except OSError:
+        return []
+
+
 def _load_statsig_stable_id(statsig_dir: Path) -> Optional[str]:
-    for child in sorted(statsig_dir.glob("statsig.stable_id.*")):
+    for child in _safe_glob(statsig_dir, "statsig.stable_id.*"):
         value = _load_json_scalar_string(child)
         if value:
             return value
 
-    for child in sorted(statsig_dir.glob("statsig.cached.evaluations.*")):
+    for child in _safe_glob(statsig_dir, "statsig.cached.evaluations.*"):
         payload = _load_json(child)
         if not isinstance(payload, dict):
             continue
@@ -243,12 +278,12 @@ def _load_statsig_stable_id(statsig_dir: Path) -> Optional[str]:
 
 
 def _load_statsig_session_id(statsig_dir: Path) -> Optional[str]:
-    for child in sorted(statsig_dir.glob("statsig.session_id.*")):
+    for child in _safe_glob(statsig_dir, "statsig.session_id.*"):
         value = _load_json_scalar_string(child)
         if value:
             return value
 
-    for child in sorted(statsig_dir.glob("statsig.cached.evaluations.*")):
+    for child in _safe_glob(statsig_dir, "statsig.cached.evaluations.*"):
         payload = _load_json(child)
         if not isinstance(payload, dict):
             continue
@@ -257,7 +292,7 @@ def _load_statsig_session_id(statsig_dir: Path) -> Optional[str]:
         if value:
             return value
 
-    for child in sorted(statsig_dir.glob("statsig.failed_logs.*")):
+    for child in _safe_glob(statsig_dir, "statsig.failed_logs.*"):
         payload = _load_json(child)
         value = _extract_nested_string(payload, ("0", "user", "customIDs", "sessionId"))
         if value:
@@ -347,7 +382,14 @@ def _iter_candidate_files(roots: Iterable[Path]) -> Iterator[Path]:
         if not root.exists():
             continue
         if root.is_file():
-            resolved = root.resolve()
+            # ``resolve()`` can raise OSError if the file is unlinked
+            # between exists() and resolve() (race with cc rotating
+            # state files). Wrap so a single missing file doesn't
+            # abort the entire remap pass.
+            try:
+                resolved = root.resolve()
+            except OSError:
+                continue
             if resolved in seen:
                 continue
             seen.add(resolved)
@@ -361,7 +403,13 @@ def _iter_candidate_files(roots: Iterable[Path]) -> Iterator[Path]:
             for child in root.rglob("*"):
                 if not child.is_file():
                     continue
-                resolved = child.resolve()
+                # R7 pass-2 M2: per-child resolve() can race with cc
+                # rotating files. Skip the bad child instead of letting
+                # OSError abort the rest of THIS root.
+                try:
+                    resolved = child.resolve()
+                except OSError:
+                    continue
                 if resolved in seen:
                     continue
                 seen.add(resolved)
@@ -569,16 +617,13 @@ def _short(value: str) -> str:
 
 
 def _ensure_backup_root(paths: ClaudePaths, current: Optional[Path], options: RunOptions) -> Optional[Path]:
-    if not options.backup_enabled:
-        return current
-    if current is not None:
-        return current
-    backup_root = paths.backup_root_base / Path("remap-%s" % _now_stamp())
-    backup_root.mkdir(parents=True, exist_ok=True)
-    return backup_root
+    """Delegate to services._ensure_backup_root for the meta sidecar +
+    microsecond+uuid suffix machinery.
 
-
-def _now_stamp() -> str:
-    from datetime import datetime
-
-    return datetime.now().strftime("%Y%m%d-%H%M%S")
+    The previous local helper used second-resolution stamps and
+    skipped the metadata write; two history-remap runs in the same
+    wall-clock second collided into the same directory and lost the
+    config_root anchor needed by ``restore``. Sharing the services
+    factory removes both regressions in one move.
+    """
+    return _services_ensure_backup_root(paths, current, options)

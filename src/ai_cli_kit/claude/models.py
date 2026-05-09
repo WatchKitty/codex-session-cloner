@@ -15,9 +15,11 @@ class CleanupTarget:
     target_path: str
     json_fields: Tuple[str, ...] = ()
     env_keys: Tuple[str, ...] = ()
+    glob_patterns: Tuple[str, ...] = ()
     default_selected: bool = False
     danger: bool = False
     may_remove_sessions: bool = False
+    deep_scrub: bool = False
 
 
 @dataclass(frozen=True)

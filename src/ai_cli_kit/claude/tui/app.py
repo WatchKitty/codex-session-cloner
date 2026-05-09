@@ -111,6 +111,18 @@ class CleanerTuiApp:
                         self.state.cursor_index = index
                         self._toggle_index(index, plan)
                         plan_dirty = True
+                    elif key == "0":
+                        # Distinct flash so the user knows "0" isn't
+                        # a no-op bug — they should press 1 for the
+                        # first item.
+                        self.state.flash_message = "数字键从 1 开始；按 1 进入第 1 项。"
+                        frame_dirty = True
+                    else:
+                        # 1-9 out-of-range (target list shorter than
+                        # the digit pressed). Quiet flash so the user
+                        # learns the bound without panic.
+                        self.state.flash_message = "当前没有第 %s 项目标。" % key
+                        frame_dirty = True
                     continue
 
                 lower = key.lower()

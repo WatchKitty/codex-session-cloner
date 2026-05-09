@@ -88,12 +88,43 @@ python -m ai_cli_kit.claude
 ./aik claude clean --preset safe --yes         # 执行安全清理（自动备份）
 ./aik claude clean --preset full --yes         # 完整重置（含会话数据，慎用）
 ./aik claude remap-history --run-claude --yes  # 重新生成新 ID 并回写历史
+./aik claude restore <backup-path> --yes       # 从备份目录还原
+./aik claude prune-backups --keep 5 --yes      # 清理旧备份目录
+./aik claude debug-paths --format json         # 诊断：查看解析后的路径 + env
+./aik claude list-targets                      # 列出所有清理目标键名
 ./aik claude --help
 ```
 
 兼容写法：`./aik claude` 等价于 `./cc-clean`。
 
-**安全机制**：所有删除默认走 `~/.claude-clean-backups/<时间戳>/` 备份目录，可随时恢复。`--no-backup` 显式关闭备份；`--dry-run` 只预览不动磁盘。
+**清理覆盖范围（40+ targets）**：
+
+```
+身份/凭据：state_user_id, state_full_identity, legacy_state_file, credentials_file,
+            macos_keychain (含 16 服务名变体), settings_auth_env
+PII / 缓存：telemetry, statsig, paste-cache, dump-prompts, traces, file-history,
+            image-cache, stats-cache, startup-perf, usage-data, uploads (bridge)
+状态/索引：plugins, debug, ide, teams, session-env, agent-memory, mcp-needs-auth-cache,
+            policy-limits, remote-settings, computer-use.lock, output-styles, completion.*
+旧备份：   ~/.claude/backups/.claude*.json.{backup,corrupted}.* + 旧版 HOME 直下兼容
+危险（默认不勾）：projects, history, sessions, user_claude_md, plans, jobs, tasks
+环境重定向（动态）：CLAUDE_CONFIG_DIR / CLAUDE_COWORK_MEMORY_PATH_OVERRIDE /
+                  CLAUDE_CODE_PLUGIN_CACHE_DIR / CLAUDE_CODE_REMOTE_MEMORY_DIR
+                  / CLAUDE_CODE_TMPDIR
+跨 OS：    Windows 长路径 + 保留名 sanitize / NTFS junction 守卫 /
+          macOS NFC 路径 / POSIX 0o700 备份目录权限
+```
+
+**安全机制**：
+
+- 默认所有删除走 `~/.claude-clean-backups/<时间戳-uuid>/` 备份目录，POSIX 上 0o700 + 内文件 0o600
+- 备份带 `_cc_clean_meta.json` sidecar 记录原始 anchor，确保 restore 能还原到正确位置
+- restore 严格防路径穿越：trusted-anchor whitelist + commonpath 边界 + dst 父链 realpath
+- 跨进程文件锁防并发（execute_plan / restore / prune-backups 三入口）
+- 异常消息脱敏（不在 JSON 输出中泄露文件路径）
+- `--no-backup` 显式关闭备份；`--dry-run` 只预览不动磁盘
+
+**JSON 模式**：所有子命令支持 `--format json` 输出单文档 envelope `{command, status, ...}`，`status` 为 `ok` / `partial` / `error` / `empty`。`--format=json` 模式下未传 `--yes` 且非 `--dry-run` 时拒绝执行（防自动化脚本无意识破坏数据）。
 
 ## 制作发布包
 

@@ -7,6 +7,7 @@ fails fast in CI rather than corrupting state on a user's Windows install.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import sys
@@ -196,14 +197,14 @@ class RelativeUnderHomeCaseTests(unittest.TestCase):
             home = Path(tmp_dir)
             (home / ".claude").mkdir()
             target = home / ".claude" / "state.json"
-            self.assertEqual(_relative_under_home(home, target), Path(".claude/state.json"))
+            self.assertEqual(_relative_under_home(home, source=target), Path(".claude/state.json"))
 
     def test_path_outside_home_falls_through_to_external(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             home = Path(tmp_dir) / "home"
             home.mkdir()
             outside = Path(tmp_dir) / "elsewhere" / "x"
-            self.assertTrue(str(_relative_under_home(home, outside)).startswith("external"))
+            self.assertTrue(str(_relative_under_home(home, source=outside)).startswith("external"))
 
     def test_case_variant_path_treated_as_inside_on_insensitive_fs(self) -> None:
         if os.path.normcase("ABC") == "ABC":
@@ -212,7 +213,7 @@ class RelativeUnderHomeCaseTests(unittest.TestCase):
             home = Path(tmp_dir) / "home"
             (home / ".claude").mkdir(parents=True)
             up_target = Path(str(home).upper()) / ".claude" / "state.json"
-            relative = _relative_under_home(home, up_target)
+            relative = _relative_under_home(home, source=up_target)
             self.assertFalse(str(relative).startswith("external"))
 
 
@@ -245,22 +246,25 @@ class PathSizeCacheTests(unittest.TestCase):
         self.assertEqual(len(_PATH_SIZE_CACHE), cache_size_before,
                          "second call added a new cache entry — cache miss when it should hit")
 
-    def test_rglob_failure_returns_zero_not_crash(self) -> None:
+    def test_scandir_failure_returns_zero_not_crash(self) -> None:
         """If the directory disappears mid-walk (user ``rm -rf`` from another
         shell while the TUI is open), ``_path_size`` must return 0 rather
         than propagate ``OSError`` — otherwise the entire claude TUI dies
         on the user's next keypress.
 
-        We simulate by patching ``Path.rglob`` to raise ``OSError`` directly,
-        which is what the OS would do if the directory vanished after the
-        exists()/stat() check passed.
+        ``_path_size`` switched from ``Path.rglob`` to ``os.scandir``; this
+        test patches the new API so the regression target moves with the
+        implementation.
         """
         from unittest.mock import patch
         from ai_cli_kit.claude.services import _path_size
 
-        with patch("pathlib.Path.rglob", side_effect=OSError("ENOENT (simulated)")):
+        # Pre-populate so the dir registers as non-empty during pre-checks.
+        (self.dir / "x.txt").write_text("payload", encoding="utf-8")
+
+        with patch("ai_cli_kit.claude.services.os.scandir", side_effect=OSError("ENOENT (simulated)")):
             result = _path_size(self.dir)
-        self.assertEqual(result, 0, "rglob OSError must return 0, not crash")
+        self.assertEqual(result, 0, "scandir OSError must return 0, not crash")
 
     def test_cache_concurrent_access_is_safe(self) -> None:
         """Concurrent ``_path_size`` calls must not corrupt the cache.
@@ -337,6 +341,159 @@ class FullCleanupRoundtripTests(unittest.TestCase):
             self.assertEqual(payload["keep"], 1)
             self.assertFalse(paths.telemetry_dir.exists())
             self.assertIsNotNone(summary.backup_root)
+
+
+class CrossFsBackupTests(unittest.TestCase):
+    """Backup-then-remove path stays correct across simulated filesystem boundaries."""
+
+    def test_cross_fs_uses_copy_then_unlink_not_shutil_move(self) -> None:
+        from unittest.mock import patch
+        from ai_cli_kit.claude.services import _move_or_copy_then_delete
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            src_dir = Path(tmp_dir) / "src"
+            src_dir.mkdir()
+            (src_dir / "leaf.txt").write_text("payload-bytes", encoding="utf-8")
+            dst_dir = Path(tmp_dir) / "dst"
+
+            with patch("ai_cli_kit.claude.services._same_filesystem", return_value=False):
+                _move_or_copy_then_delete(src_dir, dst_dir)
+
+            self.assertFalse(src_dir.exists())
+            self.assertTrue(dst_dir.exists())
+            self.assertEqual(
+                (dst_dir / "leaf.txt").read_text(encoding="utf-8"),
+                "payload-bytes",
+            )
+
+    def test_cross_fs_raises_when_destination_short(self) -> None:
+        from unittest.mock import patch
+        from ai_cli_kit.claude.services import _move_or_copy_then_delete
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            src_dir = Path(tmp_dir) / "src"
+            src_dir.mkdir()
+            (src_dir / "leaf.txt").write_text("payload-bytes", encoding="utf-8")
+            dst_dir = Path(tmp_dir) / "dst"
+
+            # Force cross-fs path AND short-circuit copytree to leave dst empty,
+            # which the size-verification step should detect.
+            def fake_copytree(src, dst, *args, **kwargs):
+                Path(dst).mkdir(parents=True, exist_ok=True)
+                # Intentionally leave content out so the size check trips.
+
+            with patch("ai_cli_kit.claude.services._same_filesystem", return_value=False), \
+                    patch("ai_cli_kit.claude.services.shutil.copytree", side_effect=fake_copytree):
+                with self.assertRaises(RuntimeError):
+                    _move_or_copy_then_delete(src_dir, dst_dir)
+
+            # Source must still be intact since we refused to delete it.
+            self.assertTrue((src_dir / "leaf.txt").exists())
+
+
+class SymlinkRemovePathTests(unittest.TestCase):
+    """``remove_path`` does not follow symlinks: link is dropped, target survives."""
+
+    def test_remove_symlink_leaves_underlying_data_intact(self) -> None:
+        if sys.platform == "win32":
+            self.skipTest("symlink test skipped on Windows without dev mode")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            home = Path(tmp_dir)
+            paths = default_paths(home)
+            paths.claude_dir.mkdir(parents=True)
+            external = home / "external-store"
+            external.mkdir()
+            (external / "session.jsonl").write_text("payload", encoding="utf-8")
+            os.symlink(external, paths.sessions_dir)
+
+            plan = build_plan(paths, resolve_selection("safe"))
+            sessions_item = next(item for item in plan if item.target.key == "sessions_dir")
+            self.assertTrue(any("符号链接" in w for w in sessions_item.warnings))
+
+            execute_plan(paths, build_plan(paths, {"sessions_dir"}), RunOptions(backup_enabled=False, dry_run=False))
+            self.assertFalse(paths.sessions_dir.exists())
+            # External target untouched.
+            self.assertTrue((external / "session.jsonl").exists())
+
+
+class PathSizeChildMtimeTests(unittest.TestCase):
+    """Cache must invalidate when a deeper subdir gains a file even if the
+    top-level dir's mtime did NOT change."""
+
+    def test_subdir_only_write_invalidates_cache_via_child_signature(self) -> None:
+        from ai_cli_kit.claude.services import _PATH_SIZE_CACHE, _path_size
+
+        _PATH_SIZE_CACHE.clear()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            top = Path(tmp_dir) / "top"
+            sub = top / "sub"
+            sub.mkdir(parents=True)
+            (sub / "a.txt").write_text("aa", encoding="utf-8")
+
+            # Freeze the top-level mtime so a naive mtime cache would miss
+            # the upcoming subdir write.
+            top_mtime = top.stat().st_mtime
+            first = _path_size(top)
+            self.assertEqual(first, 2)
+
+            (sub / "b.txt").write_text("bbbb", encoding="utf-8")
+            os.utime(top, (top_mtime, top_mtime))
+
+            second = _path_size(top)
+            self.assertEqual(second, 6, "child-mtime signature should detect subdir-only growth")
+
+
+class PathSizeLruTests(unittest.TestCase):
+    """LRU eviction keeps the working set hot; old entries fall off one at a time."""
+
+    def test_lru_eviction_drops_oldest_first_not_full_clear(self) -> None:
+        from ai_cli_kit.claude.services import _PATH_SIZE_CACHE, _PATH_SIZE_CACHE_MAX, _path_size
+
+        _PATH_SIZE_CACHE.clear()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base = Path(tmp_dir)
+            # Fill cache to the cap +1, expecting the very first entry to evict.
+            paths_to_size = []
+            for idx in range(_PATH_SIZE_CACHE_MAX + 1):
+                d = base / f"dir-{idx}"
+                d.mkdir()
+                (d / "x").write_text("y", encoding="utf-8")
+                paths_to_size.append(d)
+
+            for d in paths_to_size:
+                _path_size(d)
+
+            self.assertLessEqual(len(_PATH_SIZE_CACHE), _PATH_SIZE_CACHE_MAX)
+            # Cache should still hold something (not nuked entirely).
+            self.assertGreater(len(_PATH_SIZE_CACHE), 0)
+
+
+class TransientErrorRetryTests(unittest.TestCase):
+    """Retry now widens beyond PermissionError to OSError EBUSY/ENOTEMPTY/winerror=32."""
+
+    def test_remove_with_retry_swallows_ebusy(self) -> None:
+        from unittest.mock import patch
+        from ai_cli_kit.claude.services import _remove_with_retry
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            target = Path(tmp_dir) / "f.txt"
+            target.write_text("x", encoding="utf-8")
+
+            attempts = {"count": 0}
+            real_unlink = os.unlink
+
+            def flaky_unlink(p):
+                attempts["count"] += 1
+                if attempts["count"] < 2:
+                    raise OSError(errno.EBUSY, "device busy")
+                return real_unlink(p)
+
+            with patch("ai_cli_kit.claude.services.os.unlink", side_effect=flaky_unlink):
+                _remove_with_retry(target)
+
+            self.assertFalse(target.exists())
+            self.assertGreaterEqual(attempts["count"], 2)
 
 
 if __name__ == "__main__":
