@@ -223,6 +223,7 @@ TARGET_ORDER = (
     "xdg_data_claude",
     "xdg_cache_claude",
     "xdg_state_claude",
+    "ccr_dir",
     # Existing
     "json_state_backups",
     "json_state_backups_legacy_home",
@@ -374,21 +375,36 @@ def resolve_auto_memory_override_state(
 
     Distinguishes "unset" from "set-but-rejected" so the planner can
     warn users whose intended redirect is silently ignored by cc.
+
+    R10 pass-2 M1: cc's resolver is ``getAutoMemPathOverride() ??
+    getAutoMemPathSetting()`` (memdir/paths.ts:225). The ``??`` falls
+    through when env is undefined OR returns rejected (validateMemoryPath
+    returns undefined for invalid). My R9 tri-state refactor early-returned
+    env-rejected without consulting settings — diverging from cc. If the
+    user has both an INVALID env AND a VALID settings.autoMemoryDirectory,
+    cc uses settings; we'd report rejected and miss the actual location.
+    Fall through to settings on env-reject; only report env rejection
+    when settings is also unset/rejected (so the user still gets the
+    earlier-signal warning).
     """
     if env is None:
         env = os.environ
     raw_env = env.get(_AUTO_MEMORY_ENV_VAR)
+    env_rejected_raw: Optional[str] = None
     if raw_env:
         validated = _validate_memory_path(raw_env, expand_tilde=False)
         if validated is not None:
             return AutoMemoryOverride(valid_path=validated)
-        return AutoMemoryOverride(rejected_raw=raw_env, rejected_source="env")
+        env_rejected_raw = raw_env
     raw_setting = _read_auto_memory_setting(paths)
     if raw_setting:
         validated = _validate_memory_path(raw_setting, expand_tilde=True)
         if validated is not None:
             return AutoMemoryOverride(valid_path=validated)
-        return AutoMemoryOverride(rejected_raw=raw_setting, rejected_source="settings")
+        if env_rejected_raw is None:
+            return AutoMemoryOverride(rejected_raw=raw_setting, rejected_source="settings")
+    if env_rejected_raw is not None:
+        return AutoMemoryOverride(rejected_raw=env_rejected_raw, rejected_source="env")
     return AutoMemoryOverride()
 
 
@@ -738,6 +754,17 @@ def build_targets(paths: ClaudePaths) -> Tuple[CleanupTarget, ...]:
             action="remove_path",
             target_path=str(paths.xdg_state_claude),
             default_selected=True,
+        ),
+        CleanupTarget(
+            key="ccr_dir",
+            label="删除 ~/.ccr",
+            description=(
+                "cc upstreamproxy 自定义 CA bundle (ca-bundle.crt)。"
+                "仅当 ANTHROPIC_BASE_URL 走代理需要自签证书时存在。默认不勾。"
+            ),
+            action="remove_path",
+            target_path=str(paths.ccr_dir),
+            default_selected=False,
         ),
         CleanupTarget(
             key="workflows_dir",
@@ -1090,7 +1117,7 @@ def build_targets(paths: ClaudePaths) -> Tuple[CleanupTarget, ...]:
         *_build_remote_memory_redirect_targets(paths),
         CleanupTarget(
             key="scratchpad_tmp_dir",
-            label="清理 ${TMPDIR}/claude scratchpad 目录",
+            label="清理 ${CLAUDE_CODE_TMPDIR}/claude scratchpad 目录",
             description=(
                 "cc 在每会话 scratchpad 目录里暂存工具/prompt 副本。POSIX: "
                 "${CLAUDE_CODE_TMPDIR or /tmp}/claude-<uid>/。Windows: "
@@ -1098,7 +1125,9 @@ def build_targets(paths: ClaudePaths) -> Tuple[CleanupTarget, ...]:
                 "正常退出会清，崩溃后残留。"
             ),
             action="purge_scratchpad",
-            target_path="posix-scratchpad",
+            # Magic-string placeholder; the executor reads via
+            # ``_resolve_scratchpad_root`` instead of this field.
+            target_path="<scratchpad-resolver>",
             default_selected=False,
         ),
         # ``auto_memory_override`` is dynamic: only present when the user
@@ -1448,6 +1477,20 @@ def _restore_from_backup_locked(
         # config_root as a hint for backups taken before we shipped meta.
         anchors.insert(0, paths.config_root)
 
+    # R10 pass-4 H1: extend `anchors` (used for ``chosen_anchor``
+    # resolution at L1513) with XDG parents falling outside home.
+    # Without this, files that backup as ``claude/...`` (anchored on
+    # ``$XDG_DATA_HOME`` etc) restore to ``$HOME/claude/...`` instead
+    # of the original XDG location — silent data misplacement.
+    # Symmetric with `_relative_under_anchors` extension at the
+    # backup-build site.
+    for xdg in (paths.xdg_data_claude.parent, paths.xdg_cache_claude.parent, paths.xdg_state_claude.parent):
+        try:
+            xdg.relative_to(paths.home)
+        except ValueError:
+            if xdg not in anchors:
+                anchors.append(xdg)
+
     records: List[ExecutionRecord] = []
     restored = 0
     skipped = 0
@@ -1493,9 +1536,43 @@ def _restore_from_backup_locked(
         # them when CLAUDE_CONFIG_DIR is unset). ``.claude.json`` (no
         # subdir) fits whichever anchor was active at backup time —
         # prefer the meta-recorded one, falling back to home.
+        # ``claude/...`` (no leading dot) is XDG-anchored — prefer the
+        # XDG parent matching the layout (R10 pass-4 H1).
         chosen_anchor = anchors[0]
         if relative.parts and relative.parts[0] == ".claude":
             chosen_anchor = paths.home
+        elif relative.parts and relative.parts[0] == "claude":
+            # XDG-redirected backup. R10 pass-6 H1: when MORE THAN ONE
+            # of XDG_{DATA,CACHE,STATE}_HOME is outside ``$HOME``, the
+            # naive "first outside-home XDG parent" picks data for
+            # everything — a cache file from
+            # ``XDG_CACHE_HOME=/srv/cache/claude/staging/x`` lands at
+            # ``/srv/data/claude/staging/x``, invisible to cc.
+            # Route by cc's native-installer subdir convention
+            # (verified against ``installer.ts``):
+            #   ``claude/versions/`` -> data
+            #   ``claude/staging/``  -> cache
+            #   ``claude/locks/``    -> state
+            # Unknown subdirs (or no subdir) fall back to data — cc's
+            # most-populated XDG dir, matching pre-fix behaviour.
+            #
+            # R10 pass-5 H1: when none of the three XDG parents sits
+            # outside home (default layout), restore to the picked
+            # type's ``$HOME/.local/share|cache|state/claude/...`` —
+            # the right cc-discoverable location instead of bare
+            # ``$HOME/claude/``.
+            xdg_picks = (
+                paths.xdg_data_claude.parent,
+                paths.xdg_cache_claude.parent,
+                paths.xdg_state_claude.parent,
+            )
+            second = relative.parts[1] if len(relative.parts) >= 2 else None
+            if second == "staging":
+                chosen_anchor = xdg_picks[1]
+            elif second == "locks":
+                chosen_anchor = xdg_picks[2]
+            else:
+                chosen_anchor = xdg_picks[0]
         dst_path = chosen_anchor / relative
         # R7 pass-4 H1 (security): defense-in-depth path containment.
         # Even after anchor validation, the relative path may use
@@ -1609,10 +1686,20 @@ def _restore_from_backup_locked(
                 # backup tarball could otherwise drop a link like
                 # ``~/.claude/projects → /etc/passwd`` so that cc's
                 # next write goes to attacker-controlled paths.
-                # Per-anchor allowlist mirrors _relative_under_anchors.
+                # Per-anchor allowlist mirrors _relative_under_anchors
+                # (R10 pass-3 H1: include XDG parents too — without
+                # them, a legit symlink whose target points under
+                # ``XDG_DATA_HOME=/srv/share`` is rejected as path
+                # traversal, breaking the R9 M2 XDG round-trip).
                 allowed_anchors = [paths.home]
                 if paths.config_root != paths.home:
                     allowed_anchors.append(paths.config_root)
+                for xdg in (paths.xdg_data_claude.parent, paths.xdg_cache_claude.parent, paths.xdg_state_claude.parent):
+                    try:
+                        xdg.relative_to(paths.home)
+                    except ValueError:
+                        if xdg not in allowed_anchors:
+                            allowed_anchors.append(xdg)
                 target_safe = False
                 if target:
                     try:
@@ -3305,6 +3392,14 @@ def _relative_under_anchors(paths: ClaudePaths, source: Path) -> Path:
     dirs sit outside ``home``. Without the XDG entries, env-redirected
     XDG_DATA_HOME=/srv/share fell through to ``external/...`` and
     couldn't round-trip through restore (R9 M2).
+
+    R10 M2: anchors are sorted by descending path length BEFORE the
+    match so the most-specific anchor wins. Without this, overlapping
+    custom XDG roots like ``XDG_DATA_HOME=/srv`` +
+    ``XDG_CACHE_HOME=/srv/cache`` would have ``/srv`` (parent) match
+    first for cache files, producing relative ``cache/claude/x``
+    instead of ``claude/x`` and breaking restore-tree symmetry on
+    a default-XDG host.
     """
     anchors: List[Path] = [paths.home]
     if paths.config_root != paths.home:
@@ -3320,6 +3415,10 @@ def _relative_under_anchors(paths: ClaudePaths, source: Path) -> Path:
         except ValueError:
             if xdg not in anchors:
                 anchors.append(xdg)
+    # R10 M2: sort by descending path length — longer/more-specific
+    # anchors win first. Stable sort preserves insertion order for
+    # ties (anchors of equal length are extremely rare).
+    anchors.sort(key=lambda p: len(str(p)), reverse=True)
     return _relative_under_home(*anchors, source=source)
 
 

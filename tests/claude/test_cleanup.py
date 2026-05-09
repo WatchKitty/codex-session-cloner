@@ -2259,6 +2259,148 @@ class R9XdgRestoreRoundTripTests(unittest.TestCase):
             )
 
 
+class R10XdgCrossHostRestoreTests(unittest.TestCase):
+    """R10 pass-5 H1: XDG-redirected backup must restore to the current
+    host's XDG_DATA_HOME/claude (not bare $HOME/claude/)."""
+
+    def test_xdg_backup_restored_to_current_xdg_default_layout(self) -> None:
+        from ai_cli_kit.claude.paths import resolve_default_paths
+        from ai_cli_kit.claude.services import restore_from_backup
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            home = Path(tmp_dir) / "home"
+            home.mkdir()
+            paths = resolve_default_paths(home, env={})
+            # Simulate a backup taken with XDG_DATA_HOME=/srv/share — file
+            # lives at backup_root/claude/versions/1.0/claude.exe.
+            backup_root = paths.backup_root_base / "manual"
+            (backup_root / "claude" / "versions" / "1.0").mkdir(parents=True)
+            (backup_root / "claude" / "versions" / "1.0" / "claude.exe").write_text(
+                "demo", encoding="utf-8"
+            )
+            summary = restore_from_backup(paths, backup_root, overwrite=True)
+            updated = [r for r in summary.records if r.status == "updated"]
+            self.assertTrue(updated, "XDG backup not restored at all")
+            # Should land at host's $HOME/.local/share/claude/versions/1.0/...
+            # (NOT bare $HOME/claude/...).
+            expected = paths.xdg_data_claude / "versions" / "1.0" / "claude.exe"
+            stray = home / "claude" / "versions" / "1.0" / "claude.exe"
+            self.assertTrue(expected.exists(),
+                            "XDG backup should restore to %s" % expected)
+            self.assertFalse(stray.exists(),
+                             "stray $HOME/claude/ leaked: %s" % stray)
+
+    def test_multi_xdg_routes_by_subdir(self) -> None:
+        """R10 pass-6 H1: cache file (claude/staging/...) restores to
+        xdg_cache_claude.parent, not xdg_data_claude.parent, even when
+        BOTH XDG_DATA_HOME and XDG_CACHE_HOME are outside $HOME.
+        """
+        from ai_cli_kit.claude.paths import resolve_default_paths
+        from ai_cli_kit.claude.services import restore_from_backup
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            home = tmp / "home"
+            home.mkdir()
+            srv_data = tmp / "srv-data"
+            srv_cache = tmp / "srv-cache"
+            srv_state = tmp / "srv-state"
+            paths = resolve_default_paths(
+                home,
+                env={
+                    "XDG_DATA_HOME": str(srv_data),
+                    "XDG_CACHE_HOME": str(srv_cache),
+                    "XDG_STATE_HOME": str(srv_state),
+                },
+            )
+            backup_root = paths.backup_root_base / "manual"
+            (backup_root / "claude" / "versions" / "1.0").mkdir(parents=True)
+            (backup_root / "claude" / "versions" / "1.0" / "bin").write_text("x")
+            (backup_root / "claude" / "staging" / "1.0").mkdir(parents=True)
+            (backup_root / "claude" / "staging" / "1.0" / "tmp.bin").write_text("y")
+            (backup_root / "claude" / "locks").mkdir(parents=True)
+            (backup_root / "claude" / "locks" / "pid.lock").write_text("z")
+            restore_from_backup(paths, backup_root, overwrite=True)
+            self.assertTrue((srv_data / "claude" / "versions" / "1.0" / "bin").exists())
+            self.assertTrue((srv_cache / "claude" / "staging" / "1.0" / "tmp.bin").exists())
+            self.assertTrue((srv_state / "claude" / "locks" / "pid.lock").exists())
+            self.assertFalse((srv_data / "claude" / "staging" / "1.0" / "tmp.bin").exists())
+            self.assertFalse((srv_data / "claude" / "locks" / "pid.lock").exists())
+
+
+class R10AutoMemoryFallthroughTests(unittest.TestCase):
+    """R10 pass-2 M1: env-rejected MUST fall through to settings, not
+    early-return rejected. Mirrors cc's `?? ` semantic."""
+
+    def test_invalid_env_falls_through_to_valid_settings(self) -> None:
+        from ai_cli_kit.claude.services import resolve_auto_memory_override_state
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            home = Path(tmp_dir)
+            paths = default_paths(home)
+            paths.claude_dir.mkdir(parents=True)
+            paths.settings_file.write_text(
+                json.dumps({"autoMemoryDirectory": "/srv/memories"}),
+                encoding="utf-8",
+            )
+            # Env is set but INVALID (relative path — rejected by validator).
+            state = resolve_auto_memory_override_state(
+                paths,
+                env={"CLAUDE_COWORK_MEMORY_PATH_OVERRIDE": "../bad-relative"},
+            )
+            # Must NOT report rejected — settings provides a valid override.
+            self.assertIsNotNone(state.valid_path)
+            self.assertIn("/srv/memories", str(state.valid_path))
+
+    def test_invalid_env_invalid_settings_reports_env_rejection(self) -> None:
+        from ai_cli_kit.claude.services import resolve_auto_memory_override_state
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            home = Path(tmp_dir)
+            paths = default_paths(home)
+            paths.claude_dir.mkdir(parents=True)
+            paths.settings_file.write_text(
+                json.dumps({"autoMemoryDirectory": "../also-bad"}),
+                encoding="utf-8",
+            )
+            state = resolve_auto_memory_override_state(
+                paths,
+                env={"CLAUDE_COWORK_MEMORY_PATH_OVERRIDE": "../env-bad"},
+            )
+            self.assertIsNone(state.valid_path)
+            # Earlier signal wins.
+            self.assertEqual(state.rejected_source, "env")
+            self.assertEqual(state.rejected_raw, "../env-bad")
+
+
+class R10OverlappingXdgAnchorsTests(unittest.TestCase):
+    """R10 M2: when custom XDG roots nest (e.g. data=/srv,
+    cache=/srv/cache), the most-specific anchor must win the
+    relative-path match — not the first-inserted parent."""
+
+    def test_most_specific_xdg_anchor_wins(self) -> None:
+        from ai_cli_kit.claude.paths import resolve_default_paths
+        from ai_cli_kit.claude.services import _relative_under_anchors
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            home = Path(tmp_dir) / "home"
+            home.mkdir()
+            paths = resolve_default_paths(
+                home,
+                env={
+                    "XDG_DATA_HOME": "/srv",
+                    "XDG_CACHE_HOME": "/srv/cache",
+                    "XDG_STATE_HOME": "/srv/state",
+                },
+            )
+            # File under XDG_CACHE_HOME=/srv/cache — relative should be
+            # ``claude/x.txt`` (anchored at /srv/cache), not
+            # ``cache/claude/x.txt`` (anchored at /srv).
+            cache_file = paths.xdg_cache_claude / "x.txt"  # /srv/cache/claude/x.txt
+            relative = _relative_under_anchors(paths, cache_file)
+            self.assertEqual(str(relative), "claude/x.txt")
+
+
 class R9DebugPathsTriStateTests(unittest.TestCase):
     """R9 L1: debug-paths now distinguishes auto-memory unset / valid /
     rejected via ``auto_memory_override_state``."""

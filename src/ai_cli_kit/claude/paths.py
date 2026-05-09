@@ -109,6 +109,8 @@ class ClaudePaths:
     xdg_data_claude: Path           # cc nativeInstaller installer.ts:121 — ~/.local/share/claude/versions
     xdg_cache_claude: Path           # cc installer.ts:124 — ~/.cache/claude/staging
     xdg_state_claude: Path           # cc installer.ts:127 — ~/.local/state/claude/locks
+    # R10 pass-4 L1
+    ccr_dir: Path                   # cc upstreamproxy CA bundle (~/.ccr/)
     claude_backups_dir: Path
     backup_root_base: Path
 
@@ -360,6 +362,10 @@ def _build_paths(
         xdg_data_claude=(xdg_data if xdg_data is not None else home_dir / ".local" / "share") / "claude",
         xdg_cache_claude=(xdg_cache if xdg_cache is not None else home_dir / ".cache") / "claude",
         xdg_state_claude=(xdg_state if xdg_state is not None else home_dir / ".local" / "state") / "claude",
+        # cc upstreamproxy CA bundle (~/.ccr/ca-bundle.crt). Niche —
+        # only written when ANTHROPIC_BASE_URL points at a proxy that
+        # needs custom CA. Persists across machine moves, deferred OFF.
+        ccr_dir=home_dir / ".ccr",
         claude_backups_dir=claude_dir / "backups",
         # backup_root_base is INTENTIONALLY anchored on the user's real
         # ``home``, not ``config_root``. If cc data lives at
