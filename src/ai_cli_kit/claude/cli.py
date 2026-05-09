@@ -711,16 +711,23 @@ def _run_debug_paths(paths, output_format: str) -> int:
             "cowork_plugins_dir": str(paths.cowork_plugins_dir),
             "claude_backups_dir": str(paths.claude_backups_dir),
             "backup_root_base": str(paths.backup_root_base),
+            "xdg_data_claude": str(paths.xdg_data_claude),
+            "xdg_cache_claude": str(paths.xdg_cache_claude),
+            "xdg_state_claude": str(paths.xdg_state_claude),
         },
         "globs": {
             "state_backup": paths.state_backup_glob,
             "state_corrupted": paths.state_corrupted_glob,
             "completion": paths.completion_glob,
+            "mcp_refresh": paths.mcp_refresh_glob,
         },
         "env": {
             # All path-affecting env vars cc-clean knows about. Unset
-            # AND empty-string values surface as JSON null — cc treats
-            # empty as unset (pass-7 L2), so we mirror.
+            # AND empty-string values surface as JSON null. NOTE: cc's
+            # JS ``??`` operator only catches null/undefined, NOT
+            # empty strings — so cc with ``CLAUDE_CONFIG_DIR=""`` gets
+            # the literal empty string. We diverge: empty == unset
+            # for safer defaults. R8 pass-2 doc-fix.
             CLAUDE_CONFIG_DIR_ENV: os.environ.get(CLAUDE_CONFIG_DIR_ENV) or None,
             _AUTO_MEMORY_ENV_VAR: os.environ.get(_AUTO_MEMORY_ENV_VAR) or None,
             "CLAUDE_CODE_PLUGIN_CACHE_DIR": os.environ.get("CLAUDE_CODE_PLUGIN_CACHE_DIR") or None,

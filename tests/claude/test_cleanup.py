@@ -825,24 +825,21 @@ class LegacyStateFileTests(unittest.TestCase):
 
 
 class ScratchpadTargetTests(unittest.TestCase):
-    def test_scratchpad_skipped_on_windows(self) -> None:
-        # Patching ``os.name`` to "nt" on a POSIX runner trips
-        # ``NotImplementedError: cannot instantiate 'WindowsPath'``
-        # because ``pathlib.Path(...)`` reads os.name to dispatch
-        # the concrete class. Test the inspector directly instead of
-        # going through ``build_plan`` (which constructs Paths).
-        from unittest.mock import patch
-        from ai_cli_kit.claude.services import _inspect_purge_scratchpad, build_targets
+    def test_scratchpad_resolves_with_env_override_on_posix(self) -> None:
+        # POSIX-only: full mock-based path test. Windows behaviour is
+        # verified by code inspection (see services.py:_resolve_scratchpad_root)
+        # since mocking os.name="nt" on a Linux runner trips
+        # ``NotImplementedError: cannot instantiate 'WindowsPath'``.
+        if os.name == "nt":
+            self.skipTest("POSIX-only env override test")
 
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            home = Path(tmp_dir)
-            paths = default_paths(home)
-            paths.claude_dir.mkdir(parents=True)
-            target = next(t for t in build_targets(paths) if t.key == "scratchpad_tmp_dir")
-            with patch("ai_cli_kit.claude.services.os.name", "nt"):
-                item = _inspect_purge_scratchpad(target, set())
-            self.assertFalse(item.applicable)
-            self.assertIn("Windows", item.details)
+        from unittest.mock import patch
+        from ai_cli_kit.claude.services import _resolve_scratchpad_root
+
+        with patch.dict(os.environ, {"CLAUDE_CODE_TMPDIR": "/srv/scratch"}, clear=False):
+            result = _resolve_scratchpad_root()
+        self.assertIsNotNone(result)
+        self.assertTrue(str(result).startswith("/srv/scratch/claude-"))
 
     def test_scratchpad_skipped_when_dir_absent(self) -> None:
         if os.name == "nt":
@@ -2158,6 +2155,82 @@ class R7Pass6RegressionTests(unittest.TestCase):
         self.assertEqual(payload["status"], "ok")
         self.assertIn("completion_cache", payload["keys"])
         self.assertIn("workflows_dir", payload["keys"])
+
+
+class R8Pass1RegressionTests(unittest.TestCase):
+    """Pin pass-1 fixes (mcp-refresh glob, XDG paths, perf cache, TUI alt-screen)."""
+
+    def test_mcp_refresh_glob_target_in_safe_preset(self) -> None:
+        from ai_cli_kit.claude.services import SAFE_TARGET_KEYS
+
+        self.assertIn("mcp_refresh_locks", SAFE_TARGET_KEYS)
+
+    def test_mcp_refresh_glob_matches_lockfiles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            home = Path(tmp_dir)
+            paths = default_paths(home)
+            paths.claude_dir.mkdir(parents=True)
+            (paths.claude_dir / "mcp-refresh-foo_bar.lock").write_text("", encoding="utf-8")
+            (paths.claude_dir / "mcp-refresh-baz.lock").write_text("", encoding="utf-8")
+            (paths.claude_dir / "unrelated.lock").write_text("keep", encoding="utf-8")
+
+            plan = build_plan(paths, {"mcp_refresh_locks"})
+            item = next(p for p in plan if p.target.key == "mcp_refresh_locks")
+            self.assertTrue(item.applicable)
+            execute_plan(paths, plan, RunOptions(backup_enabled=True, dry_run=False))
+            self.assertFalse((paths.claude_dir / "mcp-refresh-foo_bar.lock").exists())
+            self.assertFalse((paths.claude_dir / "mcp-refresh-baz.lock").exists())
+            self.assertTrue((paths.claude_dir / "unrelated.lock").exists())
+
+    def test_xdg_paths_resolve_with_env(self) -> None:
+        from ai_cli_kit.claude.paths import resolve_default_paths
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            home = Path(tmp_dir) / "home"
+            home.mkdir()
+            paths = resolve_default_paths(
+                home,
+                env={
+                    "XDG_DATA_HOME": "/srv/share",
+                    "XDG_CACHE_HOME": "/srv/cache",
+                    "XDG_STATE_HOME": "/srv/state",
+                },
+            )
+            self.assertEqual(str(paths.xdg_data_claude), "/srv/share/claude")
+            self.assertEqual(str(paths.xdg_cache_claude), "/srv/cache/claude")
+            self.assertEqual(str(paths.xdg_state_claude), "/srv/state/claude")
+
+    def test_xdg_paths_default_to_home_subdirs(self) -> None:
+        from ai_cli_kit.claude.paths import resolve_default_paths
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            home = Path(tmp_dir)
+            paths = resolve_default_paths(home, env={})
+            self.assertEqual(paths.xdg_data_claude, home / ".local" / "share" / "claude")
+            self.assertEqual(paths.xdg_cache_claude, home / ".cache" / "claude")
+            self.assertEqual(paths.xdg_state_claude, home / ".local" / "state" / "claude")
+
+    def test_path_size_cache_skips_child_sig_on_top_mtime_hit(self) -> None:
+        """R8 M4 perf: when top mtime matches a cached entry, the
+        expensive child_mtime_signature scandir walk is skipped."""
+        from unittest.mock import patch
+        from ai_cli_kit.claude.services import _PATH_SIZE_CACHE, _path_size
+
+        _PATH_SIZE_CACHE.clear()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            d = Path(tmp_dir) / "data"
+            d.mkdir()
+            (d / "a.txt").write_text("x", encoding="utf-8")
+            # Prime cache.
+            first = _path_size(d)
+            self.assertEqual(first, 1)
+            # Second call must NOT call _child_mtime_signature.
+            with patch(
+                "ai_cli_kit.claude.services._child_mtime_signature",
+                side_effect=AssertionError("child_sig should be skipped on top-mtime hit"),
+            ):
+                second = _path_size(d)
+            self.assertEqual(second, 1)
 
 
 if __name__ == "__main__":

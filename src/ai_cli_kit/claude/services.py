@@ -218,6 +218,11 @@ TARGET_ORDER = (
     "completion_cache",
     # R7 pass-1: groups with the user-authored siblings above
     "workflows_dir",
+    # R8 pass-1 additions
+    "mcp_refresh_locks",
+    "xdg_data_claude",
+    "xdg_cache_claude",
+    "xdg_state_claude",
     # Existing
     "json_state_backups",
     "json_state_backups_legacy_home",
@@ -272,6 +277,12 @@ SAFE_TARGET_KEYS = (
     "dump_prompts_dir",
     "json_state_backups",
     "json_state_backups_legacy_home",
+    # R8 SAFE additions: mcp-refresh locks (stale crash residue),
+    # XDG cache + state (transient native-installer artifacts).
+    # XDG data dir holds binaries — deselected by default.
+    "mcp_refresh_locks",
+    "xdg_cache_claude",
+    "xdg_state_claude",
 )
 
 FULL_TARGET_KEYS = TARGET_ORDER
@@ -688,6 +699,45 @@ def build_targets(paths: ClaudePaths) -> Tuple[CleanupTarget, ...]:
             target_path=str(paths.claude_dir),
             glob_patterns=(paths.completion_glob,),
             default_selected=False,
+        ),
+        CleanupTarget(
+            key="mcp_refresh_locks",
+            label="删除 ~/.claude/mcp-refresh-*.lock",
+            description=(
+                "cc 每个 MCP server 的 OAuth 刷新锁文件。崩溃后残留会"
+                "阻塞下次启动 token 刷新。"
+            ),
+            action="remove_glob",
+            target_path=str(paths.claude_dir),
+            glob_patterns=(paths.mcp_refresh_glob,),
+            default_selected=True,
+        ),
+        CleanupTarget(
+            key="xdg_data_claude",
+            label="删除 $XDG_DATA_HOME/claude（默认 ~/.local/share/claude）",
+            description=(
+                "cc native installer 把多版本二进制安装到 XDG_DATA_HOME 下。"
+                "包括 versions/ 子目录，可能含旧版二进制。"
+            ),
+            action="remove_path",
+            target_path=str(paths.xdg_data_claude),
+            default_selected=False,
+        ),
+        CleanupTarget(
+            key="xdg_cache_claude",
+            label="删除 $XDG_CACHE_HOME/claude（默认 ~/.cache/claude）",
+            description="cc native installer staging cache (~/.cache/claude/staging/)。",
+            action="remove_path",
+            target_path=str(paths.xdg_cache_claude),
+            default_selected=True,
+        ),
+        CleanupTarget(
+            key="xdg_state_claude",
+            label="删除 $XDG_STATE_HOME/claude（默认 ~/.local/state/claude）",
+            description="cc native installer 锁文件（locks/ 子目录）。",
+            action="remove_path",
+            target_path=str(paths.xdg_state_claude),
+            default_selected=True,
         ),
         CleanupTarget(
             key="workflows_dir",
@@ -2139,16 +2189,25 @@ def _inspect_purge_keychain(target: CleanupTarget, selected: Set[str]) -> PlanIt
 
 
 def _resolve_scratchpad_root() -> Optional[Path]:
-    """Locate cc's per-uid scratchpad root.
+    """Locate cc's per-session scratchpad root.
 
     cc resolves the base via ``process.env.CLAUDE_CODE_TMPDIR ||
     tmpdir()`` (utils/permissions/filesystem.ts:333). Sandboxed CI
-    workers and Cowork SDK set the env var to redirect cc's tmp,
-    which our cleanup must follow. Returns None on Windows or when
-    uid is unavailable.
+    workers and Cowork SDK set the env var to redirect cc's tmp.
+
+    R8 pass-2 M1: cc DOES write a scratchpad on Windows too —
+    ``getClaudeTempDirName()`` returns ``"claude"`` and the full path
+    is ``tmpdir()/claude/`` (typically ``%LOCALAPPDATA%\\Temp\\claude``).
+    Earlier audits assumed Windows had no scratchpad; that was wrong.
+    POSIX uses ``${TMPDIR or /tmp}/claude-<uid>/``, Windows uses
+    ``${CLAUDE_CODE_TMPDIR or %TEMP%}/claude/`` (no uid suffix —
+    Windows already partitions %TEMP% per user via the profile dir).
     """
+    import tempfile
+
     if os.name == "nt":
-        return None
+        base = os.environ.get("CLAUDE_CODE_TMPDIR") or tempfile.gettempdir()
+        return Path(base) / "claude"
     try:
         uid = os.getuid()  # type: ignore[attr-defined]
     except (AttributeError, OSError):
@@ -2158,24 +2217,17 @@ def _resolve_scratchpad_root() -> Optional[Path]:
 
 
 def _inspect_purge_scratchpad(target: CleanupTarget, selected: Set[str]) -> PlanItem:
-    """POSIX-only scratchpad cleanup planner.
+    """Scratchpad cleanup planner.
 
     cc writes per-session scratchpads under
-    ``${CLAUDE_CODE_TMPDIR || /tmp}/claude-<uid>/`` (see
-    ``src/utils/permissions/filesystem.ts:333,377``). Normal exit
-    cleans them; crashes leave residue. We keep the target POSIX-only
-    because Windows uses a different temp layout cc doesn't currently
-    expose.
+    ``${CLAUDE_CODE_TMPDIR || tmpdir()}/claude[-uid]/`` on both POSIX
+    and Windows (see ``src/utils/permissions/filesystem.ts:307-347``).
+    Normal exit cleans them; crashes leave residue.
+
+    R8 pass-2 M1: previously we early-returned on Windows under the
+    false belief that cc didn't write a scratchpad there. cc's
+    ``getClaudeTempDirName() = 'claude'`` on win32 too — fixed.
     """
-    if os.name == "nt":
-        return PlanItem(
-            target=target,
-            selected=target.key in selected,
-            exists=False,
-            applicable=False,
-            size_bytes=0,
-            details="Windows 平台，跳过 (cc 不在此布局下暂存 scratchpad)。",
-        )
     scratch_root = _resolve_scratchpad_root()
     if scratch_root is None:
         return PlanItem(
@@ -2753,12 +2805,8 @@ def _execute_purge_scratchpad(
     options: RunOptions,
 ) -> ExecutionRecord:
     """Wipe the per-uid scratchpad root in /tmp."""
-    if os.name == "nt":
-        return ExecutionRecord(
-            key=item.target.key,
-            status="skipped",
-            message="Windows 平台，跳过 scratchpad 清理。",
-        )
+    # R8 pass-2 M1: drop the Windows early-skip; cc DOES write a
+    # ``${TMPDIR}/claude/`` dir on Windows.
     scratch_root = _resolve_scratchpad_root()
     if scratch_root is None:
         return ExecutionRecord(
@@ -3128,6 +3176,17 @@ def _path_size(path: Path) -> int:
         top_mtime_ns = path.stat().st_mtime_ns
     except OSError:
         top_mtime_ns = 0
+    # R8 pass-1 M4 perf: try a cheap lookup keyed only on top mtime
+    # FIRST. Computing ``_child_mtime_signature`` walks every immediate
+    # child stat and is the dominant cost for large ``projects_dir``.
+    # If any cache key with the same (path, top_mtime, *) hits we can
+    # skip the child walk entirely.
+    with _PATH_SIZE_CACHE_LOCK:
+        for k, v in reversed(_PATH_SIZE_CACHE.items()):
+            if k[0] == str(path) and k[1] == top_mtime_ns:
+                _PATH_SIZE_CACHE.move_to_end(k)
+                return v
+    # Top mtime miss → child churn possible; compute the full signature.
     child_sig = _child_mtime_signature(path)
     cache_key = (str(path), top_mtime_ns, child_sig)
 

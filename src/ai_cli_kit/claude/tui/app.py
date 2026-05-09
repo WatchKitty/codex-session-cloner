@@ -69,8 +69,13 @@ class CleanerTuiApp:
 
         poll_timeout_ms = 500 if os.name == "nt" else None
 
-        self._enter_terminal()
+        # R8 pass-1 L1: enter alt-screen INSIDE the try block. If a
+        # SIGINT/SIGTERM lands between the previous "self._enter_terminal()"
+        # and "try:" lines (a real window during signal storms or
+        # OOM-killer pressure), the alt-screen leaves the user's
+        # terminal in scrambled state with no exit-sequence emitted.
         try:
+            self._enter_terminal()
             while True:
                 current_size = (term_width(), term_height())
                 if resize_pending["flag"] or current_size != last_size:

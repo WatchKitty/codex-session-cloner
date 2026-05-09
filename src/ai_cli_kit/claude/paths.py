@@ -104,6 +104,11 @@ class ClaudePaths:
     workflows_dir: Path             # markdownConfigLoader.ts:29-36 / hooks/fileSuggestions.ts:447
     output_styles_dir: Path         # already used inline; promoted to field for consistency
     completion_glob: str            # cc utils/completionCache.ts: completion.{bash,zsh,fish}
+    # R8 audit pass 1 additions
+    mcp_refresh_glob: str           # cc services/mcp/auth.ts:2097 — mcp-refresh-*.lock per server
+    xdg_data_claude: Path           # cc nativeInstaller installer.ts:121 — ~/.local/share/claude/versions
+    xdg_cache_claude: Path           # cc installer.ts:124 — ~/.cache/claude/staging
+    xdg_state_claude: Path           # cc installer.ts:127 — ~/.local/state/claude/locks
     claude_backups_dir: Path
     backup_root_base: Path
 
@@ -126,11 +131,28 @@ def default_paths(home: Optional[Path] = None) -> ClaudePaths:
         claude_dir=_nfc(home_dir / ".claude"),
         plugin_cache_env=None,
         remote_memory_env=None,
+        xdg_data=_nfc(home_dir / ".local" / "share"),
+        xdg_cache=_nfc(home_dir / ".cache"),
+        xdg_state=_nfc(home_dir / ".local" / "state"),
     )
 
 
 _PLUGIN_CACHE_DIR_ENV = "CLAUDE_CODE_PLUGIN_CACHE_DIR"
 _REMOTE_MEMORY_BASE_ENV = "CLAUDE_CODE_REMOTE_MEMORY_DIR"
+
+
+def _xdg_dir(env: Mapping[str, str], var: str, fallback: Path) -> Path:
+    """Resolve an XDG base-dir env var with the standard fallback.
+
+    cc native installer (utils/nativeInstaller/installer.ts) writes to
+    ``$XDG_DATA_HOME/claude/versions`` etc. The XDG spec defaults are
+    ``$HOME/.local/share`` / ``$HOME/.cache`` / ``$HOME/.local/state``
+    when the env var is unset or empty.
+    """
+    raw = env.get(var)
+    if raw:
+        return Path(raw).expanduser()
+    return fallback
 
 
 def resolve_default_paths(
@@ -170,12 +192,18 @@ def resolve_default_paths(
     # other string-equality checks line up byte-for-byte with cc.
     plugin_cache_env = env.get(_PLUGIN_CACHE_DIR_ENV)
     remote_memory_env = env.get(_REMOTE_MEMORY_BASE_ENV)
+    xdg_data = _xdg_dir(env, "XDG_DATA_HOME", home_dir / ".local" / "share")
+    xdg_cache = _xdg_dir(env, "XDG_CACHE_HOME", home_dir / ".cache")
+    xdg_state = _xdg_dir(env, "XDG_STATE_HOME", home_dir / ".local" / "state")
     return _build_paths(
         _nfc(home_dir),
         config_root=_nfc(config_root),
         claude_dir=_nfc(claude_dir),
         plugin_cache_env=plugin_cache_env,
         remote_memory_env=remote_memory_env,
+        xdg_data=_nfc(xdg_data),
+        xdg_cache=_nfc(xdg_cache),
+        xdg_state=_nfc(xdg_state),
     )
 
 
@@ -186,6 +214,9 @@ def _build_paths(
     claude_dir: Path,
     plugin_cache_env: Optional[str] = None,
     remote_memory_env: Optional[str] = None,
+    xdg_data: Optional[Path] = None,
+    xdg_cache: Optional[Path] = None,
+    xdg_state: Optional[Path] = None,
 ) -> ClaudePaths:
     return ClaudePaths(
         home=home_dir,
@@ -318,6 +349,17 @@ def _build_paths(
         output_styles_dir=claude_dir / "output-styles",
         # cc completion cache files (bash/zsh/fish) under claude_dir.
         completion_glob="completion.*",
+        # cc services/mcp/auth.ts:2097 writes one lockfile per MCP
+        # server (sanitized name baked in). Pattern:
+        # ``mcp-refresh-<sanitized>.lock``.
+        mcp_refresh_glob="mcp-refresh-*.lock",
+        # cc native installer (utils/nativeInstaller/installer.ts:121-127)
+        # uses XDG layout for binary versions / staging / locks. These
+        # sit OUTSIDE ~/.claude/ so legacy single-anchor cleaners miss
+        # them entirely.
+        xdg_data_claude=(xdg_data if xdg_data is not None else home_dir / ".local" / "share") / "claude",
+        xdg_cache_claude=(xdg_cache if xdg_cache is not None else home_dir / ".cache") / "claude",
+        xdg_state_claude=(xdg_state if xdg_state is not None else home_dir / ".local" / "state") / "claude",
         claude_backups_dir=claude_dir / "backups",
         # backup_root_base is INTENTIONALLY anchored on the user's real
         # ``home``, not ``config_root``. If cc data lives at
