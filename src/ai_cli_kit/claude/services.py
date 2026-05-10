@@ -252,7 +252,10 @@ TARGET_ORDER = (
 )
 
 SAFE_TARGET_KEYS = (
-    "state_user_id",
+    # R11: SAFE 默认走深度清理（state_full_identity）。``state_user_id``
+    # 仍保留为独立 target 供用户单选最小 scrub；从 SAFE 中移除以避免
+    # 对同一文件做两次原子写。深度清理是严格超集（userID 也在其中）。
+    "state_full_identity",
     "legacy_state_file",
     "telemetry_dir",
     "statsig_dir",
@@ -598,12 +601,12 @@ def build_targets(paths: ClaudePaths) -> Tuple[CleanupTarget, ...]:
         CleanupTarget(
             key="state_user_id",
             label="清理 .claude*.json 中的 userID 字段（含 oauth 后缀变体）",
-            description="对所有可能的 cc 状态文件（prod / staging / local / custom-oauth）扫一遍并移除顶层 userID。",
+            description="对所有可能的 cc 状态文件（prod / staging / local / custom-oauth）扫一遍并移除顶层 userID。R11: SAFE 已切换至 state_full_identity（严格超集），此 target 保留供 --include 单独使用。",
             action="scrub_json_fields",
             target_path=str(paths.config_root),
             json_fields=("userID",),
             glob_patterns=state_oauth_globs,
-            default_selected=True,
+            default_selected=False,
         ),
         CleanupTarget(
             key="state_full_identity",
@@ -613,7 +616,7 @@ def build_targets(paths: ClaudePaths) -> Tuple[CleanupTarget, ...]:
             target_path=str(paths.config_root),
             json_fields=STATE_PII_FIELDS,
             glob_patterns=state_oauth_globs,
-            default_selected=False,
+            default_selected=True,
             deep_scrub=True,
         ),
         CleanupTarget(

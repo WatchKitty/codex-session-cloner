@@ -39,7 +39,9 @@ class CleanupWorkflowTests(unittest.TestCase):
             plan = build_plan(paths, resolve_selection("safe"))
             items = {item.target.key: item for item in plan}
 
-            self.assertTrue(items["state_user_id"].selected)
+            # R11: SAFE 默认 state_full_identity（深度清理超集），不再含 state_user_id。
+            self.assertTrue(items["state_full_identity"].selected)
+            self.assertFalse(items["state_user_id"].selected)
             self.assertTrue(items["telemetry_dir"].selected)
             self.assertFalse(items["projects_dir"].selected)
             self.assertTrue(items["projects_dir"].applicable)
