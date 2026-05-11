@@ -7,11 +7,24 @@ import os
 import sqlite3
 import sys
 from pathlib import Path
+from typing import Any
 
 from ..errors import ToolkitError
 from ..stores.history import first_history_messages
 from ..stores.session_files import build_session_preview, is_placeholder_thread_name
 from ..support import atomic_write, file_lock, iso_to_epoch, lock_path_for, long_path
+
+
+def _sqlite_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bytes)):
+        return value
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return str(value)
+
+
+def _string_field(value: Any, default: str = "") -> str:
+    return value if isinstance(value, str) else default
 
 
 def _is_subpath(child: Path, parent: Path) -> bool:
@@ -148,20 +161,22 @@ def upsert_threads_table(
                 obj = json.loads(stripped)
             except Exception as exc:
                 raise ToolkitError(f"Failed to parse prepared session file at line {line_number}: {exc}") from exc
-            last_timestamp = obj.get("timestamp", last_timestamp)
-            if obj.get("type") == "session_meta":
+            timestamp = obj.get("timestamp")
+            if isinstance(timestamp, str) and timestamp:
+                last_timestamp = timestamp
+            if obj.get("type") == "session_meta" and isinstance(obj.get("payload"), dict):
                 meta = obj.get("payload", {})
-            elif obj.get("type") == "turn_context" and not turn_context:
+            elif obj.get("type") == "turn_context" and not turn_context and isinstance(obj.get("payload"), dict):
                 turn_context = obj.get("payload", {})
 
     history_preview = first_history_messages(history_file).get(session_id, "")
 
-    source_name = session_source or meta.get("source", "")
-    originator_name = session_originator or meta.get("originator", "")
+    source_name = _string_field(session_source) or _string_field(meta.get("source", ""))
+    originator_name = _string_field(session_originator) or _string_field(meta.get("originator", ""))
     effective_kind = session_kind or classify_session_kind(source_name, originator_name)
-    cwd = session_cwd or meta.get("cwd", "")
+    cwd = _string_field(session_cwd) or _string_field(meta.get("cwd", ""))
     first_user_message = build_session_preview(history_preview, session_file, cwd)
-    created_iso = meta.get("timestamp") or last_timestamp or updated_at
+    created_iso = _string_field(meta.get("timestamp")) or last_timestamp or updated_at
     updated_iso = updated_at or last_timestamp or created_iso
     title = (
         first_user_message
@@ -169,11 +184,11 @@ def upsert_threads_table(
         else thread_name or first_user_message or session_id
     )
     sandbox_policy = json.dumps(turn_context.get("sandbox_policy", {}), ensure_ascii=False, separators=(",", ":"))
-    approval_mode = turn_context.get("approval_policy", "on-request")
-    model_provider = meta.get("model_provider", "")
-    cli_version = meta.get("cli_version", "")
-    model = turn_context.get("model")
-    reasoning_effort = turn_context.get("effort")
+    approval_mode = _sqlite_value(turn_context.get("approval_policy", "on-request"))
+    model_provider = _string_field(meta.get("model_provider", ""))
+    cli_version = _string_field(meta.get("cli_version", ""))
+    model = _sqlite_value(turn_context.get("model"))
+    reasoning_effort = _sqlite_value(turn_context.get("effort"))
     archived = 1 if "archived_sessions" in target_rollout.parts else 0
     archived_at = iso_to_epoch(updated_iso) if archived else None
 
@@ -213,7 +228,7 @@ def upsert_threads_table(
         col_list = ", ".join(insert_cols)
         update_cols = [c for c in insert_cols if c != "id"]
         update_sql = ", ".join(f"{c}=excluded.{c}" for c in update_cols)
-        values = [data[c] for c in insert_cols]
+        values = [_sqlite_value(data[c]) for c in insert_cols]
 
         sql = f"insert into threads ({col_list}) values ({placeholders}) on conflict(id) do update set {update_sql}"
         cur.execute(sql, values)

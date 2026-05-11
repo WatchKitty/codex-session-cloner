@@ -212,6 +212,8 @@ def write_bundle_manifest(
     updated_at: str = "2026-04-11T10:00:00Z",
     thread_name: str = "",
     session_cwd: str = "",
+    session_source: str = "vscode",
+    session_originator: str = "Codex Desktop",
     session_kind: str = "desktop",
 ) -> None:
     bundle_dir.mkdir(parents=True, exist_ok=True)
@@ -224,8 +226,8 @@ def write_bundle_manifest(
         "UPDATED_AT": updated_at,
         "THREAD_NAME": thread_name,
         "SESSION_CWD": session_cwd,
-        "SESSION_SOURCE": "vscode",
-        "SESSION_ORIGINATOR": "Codex Desktop",
+        "SESSION_SOURCE": session_source,
+        "SESSION_ORIGINATOR": session_originator,
         "SESSION_KIND": session_kind,
     }
     if export_machine:
@@ -1206,10 +1208,29 @@ class CoreWorkflowTests(unittest.TestCase):
             bundled_session = bundle_dir / "codex" / session_rel
             bundled_session.parent.mkdir(parents=True, exist_ok=True)
             bundled_session.write_text(
-                "\n".join([
-                    '{"timestamp":"2026-03-19T22:00:41Z","type":"session_meta","payload":{"id":"' + session_id + '","model_provider":"source-provider","source":"vscode","originator":"Codex Desktop","cwd":"' + str(workspace / "project") + '","timestamp":"2026-03-19T22:00:41Z","cli_version":"0.1.0"}}',
-                    '{"timestamp":"2026-03-19T22:05:00Z","type":"message","payload":{"role":"assistant","text":"reply"}}',
-                ]) + "\n",
+                "\n".join(
+                    json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+                    for item in [
+                        {
+                            "timestamp": "2026-03-19T22:00:41Z",
+                            "type": "session_meta",
+                            "payload": {
+                                "id": session_id,
+                                "model_provider": "source-provider",
+                                "source": "vscode",
+                                "originator": "Codex Desktop",
+                                "cwd": str(workspace / "project"),
+                                "timestamp": "2026-03-19T22:00:41Z",
+                                "cli_version": "0.1.0",
+                            },
+                        },
+                        {
+                            "timestamp": "2026-03-19T22:05:00Z",
+                            "type": "message",
+                            "payload": {"role": "assistant", "text": "reply"},
+                        },
+                    ]
+                ) + "\n",
                 encoding="utf-8",
             )
             (bundle_dir / "history.jsonl").write_text(
@@ -1247,6 +1268,101 @@ class CoreWorkflowTests(unittest.TestCase):
                     / f"rollout-2026-03-19T22-00-41-{session_id}.jsonl"
                 ).exists()
             )
+
+    def test_import_session_serializes_structured_thread_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            dst_home = Path(tmpdir) / "dst_home"
+            workspace.mkdir()
+            write_config(dst_home, "target-provider")
+            write_state_file(dst_home)
+            create_threads_db(dst_home)
+
+            session_id = "45454545-4545-4545-8545-454545454545"
+            project_dir = workspace / "project"
+            project_dir.mkdir()
+            bundle_dir = (
+                workspace
+                / "codex_sessions"
+                / "Windows-PC"
+                / "desktop"
+                / "20260411-100000-000001"
+                / session_id
+            )
+            session_rel = Path("sessions/2026/04/10") / f"rollout-2026-04-10T10-00-00-{session_id}.jsonl"
+            bundled_session = bundle_dir / "codex" / session_rel
+            bundled_session.parent.mkdir(parents=True, exist_ok=True)
+            with bundled_session.open("w", encoding="utf-8") as fh:
+                for item in [
+                    {
+                        "timestamp": "2026-04-10T10:00:00Z",
+                        "type": "session_meta",
+                        "payload": {
+                            "id": session_id,
+                            "model_provider": "source-provider",
+                            "source": {
+                                "subagent": {
+                                    "thread_spawn": {
+                                        "parent_thread_id": "parent-thread",
+                                        "agent_role": "explorer",
+                                    }
+                                }
+                            },
+                            "originator": "Codex Desktop",
+                            "cwd": str(project_dir),
+                            "timestamp": "2026-04-10T10:00:00Z",
+                            "cli_version": "0.1.0",
+                        },
+                    },
+                    {
+                        "timestamp": "2026-04-10T10:01:00Z",
+                        "type": "turn_context",
+                        "payload": {
+                            "sandbox_policy": {"type": "workspace-write", "network_access": False},
+                            "approval_policy": {
+                                "granular": {
+                                    "request_permissions": True,
+                                    "sandbox_approval": False,
+                                }
+                            },
+                            "model": {"name": "gpt-5"},
+                            "effort": {"level": "medium"},
+                        },
+                    },
+                ]:
+                    fh.write(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n")
+            (bundle_dir / "history.jsonl").write_text(
+                '{"session_id":"' + session_id + '","text":"structured metadata import"}\n',
+                encoding="utf-8",
+            )
+            write_bundle_manifest(
+                bundle_dir,
+                session_id=session_id,
+                relative_path=f"sessions/2026/04/10/rollout-2026-04-10T10-00-00-{session_id}.jsonl",
+                export_machine="Windows-PC",
+                export_machine_key="Windows-PC",
+                session_cwd=str(project_dir),
+                session_source="",
+            )
+
+            with pushd(workspace):
+                paths = CodexPaths(home=dst_home, cwd=workspace)
+                result = import_session(paths, str(bundle_dir), desktop_visible=True)
+
+            self.assertEqual(result.session_id, session_id)
+            self.assertTrue(result.thread_row_upserted)
+
+            conn = sqlite3.connect(dst_home / ".codex" / "state_0001.sqlite")
+            row = conn.execute(
+                "select source, sandbox_policy, approval_mode, model, reasoning_effort from threads where id = ?",
+                (session_id,),
+            ).fetchone()
+            conn.close()
+            self.assertEqual(row[0], "vscode")
+            self.assertEqual(json.loads(row[1])["type"], "workspace-write")
+            self.assertTrue(json.loads(row[2])["granular"]["request_permissions"])
+            self.assertEqual(json.loads(row[3])["name"], "gpt-5")
+            self.assertEqual(json.loads(row[4])["level"], "medium")
 
     def test_import_session_uses_session_preview_when_bundle_thread_name_is_uuid(self) -> None:
         tmpdir = tempfile.mkdtemp()
