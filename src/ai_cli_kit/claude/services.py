@@ -2476,8 +2476,14 @@ def _post_copy_lockdown(_home: Path, destination: Path) -> None:
                 pass
             for root, dirs, files in os.walk(destination):
                 for d in dirs:
+                    dpath = os.path.join(root, d)
                     try:
-                        os.chmod(os.path.join(root, d), 0o700)
+                        # os.chmod follows symlinks — the backup tree may hold
+                        # symlinks copied verbatim (copytree(symlinks=True)) that
+                        # point *outside* it (e.g. ~/.claude/projects → /mnt/...).
+                        # Don't re-permission the external target.
+                        if not os.path.islink(dpath):
+                            os.chmod(dpath, 0o700)
                     except OSError:
                         continue
                 for f in files:

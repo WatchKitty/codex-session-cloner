@@ -365,13 +365,16 @@ def _build_identifier_mappings(old: IdentifierSnapshot, current: IdentifierSnaps
 
 
 def _rewrite_roots(paths: ClaudePaths) -> Tuple[Path, ...]:
+    # NB: paths.backup_root_base is deliberately NOT here. That tree is this
+    # tool's own backup store — `restore` and `load_old_identifier_snapshot`
+    # read the *original* identifiers from it; rewriting it in place would make
+    # restore irreversible and break a second remap (no old value left to map).
     return (
         paths.projects_dir,
         paths.sessions_dir,
         paths.history_file,
         paths.session_env_dir,
         paths.telemetry_dir,
-        paths.backup_root_base,
         paths.claude_backups_dir,
     )
 

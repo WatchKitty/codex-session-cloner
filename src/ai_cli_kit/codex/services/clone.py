@@ -12,7 +12,7 @@ from ..errors import ToolkitError
 from ..models import CleanupResult, CloneFileResult, CloneRunResult
 from ..paths import CodexPaths
 from ..services.provider import detect_provider
-from ..support import atomic_write
+from ..support import atomic_write, backup_file, prune_old_backups
 from ..stores.session_files import (
     build_canonical_clone_path,
     extract_session_id_from_filename,
@@ -220,9 +220,18 @@ def cleanup_clones(
 
     deleted = []
     errors = []
-    if not dry_run:
+    if not dry_run and files_to_delete:
+        # Back the file up before unlinking — `clean-clones` used to delete
+        # outright, so a mis-classified real session (e.g. a same-second
+        # timestamp collision, or a clone the old code forgot to tag) was
+        # unrecoverable. Mirrors dedupe_clones.
+        backup_parent = paths.code_dir / "repair_backups"
+        prune_old_backups(backup_parent, keep_last=20)
+        backup_root = backup_parent / f"clean-clones-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+        backed_up: set[str] = set()
         for target_path in files_to_delete:
             try:
+                backup_file(paths.code_dir, backup_root, backed_up, target_path, enabled=True)
                 target_path.unlink()
                 deleted.append(target_path)
             except OSError as exc:

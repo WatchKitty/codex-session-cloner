@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -12,7 +13,7 @@ from ..paths import CodexPaths
 from ..services.provider import detect_provider
 from ..stores.index import remove_session_index_entries
 from ..stores.session_files import iter_session_files, read_session_payload
-from ..support import backup_file, long_path, prune_old_backups
+from ..support import atomic_write, backup_file, long_path, prune_old_backups
 
 
 def _is_archived_session(path: Path) -> bool:
@@ -37,7 +38,15 @@ def _prune_state_file(state_file: Path, deleted_session_ids: set[str]) -> None:
     if not deleted_session_ids or not state_file.exists():
         return
 
-    data = json.loads(state_file.read_text(encoding="utf-8"))
+    # Best-effort: the rollout files are already deleted (with backups). If
+    # state.json is corrupt / mid-write by Desktop, leave it — `repair-desktop`
+    # cleans up dangling thread entries — rather than crash mid-cleanup.
+    try:
+        data = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(data, dict):
+        return
 
     def prune_mapping(mapping: object) -> object:
         if not isinstance(mapping, dict):
@@ -52,7 +61,11 @@ def _prune_state_file(state_file: Path, deleted_session_ids: set[str]) -> None:
         if isinstance(thread_titles, dict):
             thread_titles["titles"] = prune_mapping(thread_titles.get("titles"))
 
-    state_file.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    try:
+        with atomic_write(state_file) as fh:
+            fh.write(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+    except OSError:
+        return
 
 
 def _delete_threads_rows(state_db: Path | None, deleted_session_ids: set[str]) -> None:
@@ -61,27 +74,32 @@ def _delete_threads_rows(state_db: Path | None, deleted_session_ids: set[str]) -
 
     # long_path() prefixes \\?\ on Windows for paths > MAX_PATH so sqlite3
     # (which uses CreateFileW under the hood) can open them. POSIX no-op.
-    with sqlite3.connect(long_path(state_db), timeout=30) as conn:
-        cur = conn.cursor()
-        row = cur.execute("select name from sqlite_master where type='table' and name='threads'").fetchone()
-        if row:
-            cur.executemany("delete from threads where id = ?", [(session_id,) for session_id in deleted_session_ids])
+    # Best-effort: rollout files are already removed; a locked / corrupt
+    # state db must not abort cleanup — repair-desktop reconciles later.
+    try:
+        with closing(sqlite3.connect(long_path(state_db), timeout=30)) as conn:
+            cur = conn.cursor()
+            row = cur.execute("select name from sqlite_master where type='table' and name='threads'").fetchone()
+            if row:
+                cur.executemany("delete from threads where id = ?", [(session_id,) for session_id in deleted_session_ids])
 
-        edge_row = cur.execute("select name from sqlite_master where type='table' and name='thread_spawn_edges'").fetchone()
-        if edge_row:
-            columns = [info[1] for info in cur.execute("pragma table_info(thread_spawn_edges)").fetchall()]
-            if "parent_thread_id" in columns:
-                cur.executemany(
-                    "delete from thread_spawn_edges where parent_thread_id = ?",
-                    [(session_id,) for session_id in deleted_session_ids],
-                )
-            if "child_thread_id" in columns:
-                cur.executemany(
-                    "delete from thread_spawn_edges where child_thread_id = ?",
-                    [(session_id,) for session_id in deleted_session_ids],
-                )
+            edge_row = cur.execute("select name from sqlite_master where type='table' and name='thread_spawn_edges'").fetchone()
+            if edge_row:
+                columns = [info[1] for info in cur.execute("pragma table_info(thread_spawn_edges)").fetchall()]
+                if "parent_thread_id" in columns:
+                    cur.executemany(
+                        "delete from thread_spawn_edges where parent_thread_id = ?",
+                        [(session_id,) for session_id in deleted_session_ids],
+                    )
+                if "child_thread_id" in columns:
+                    cur.executemany(
+                        "delete from thread_spawn_edges where child_thread_id = ?",
+                        [(session_id,) for session_id in deleted_session_ids],
+                    )
 
-        conn.commit()
+            conn.commit()
+    except sqlite3.Error:
+        return
 
 
 def dedupe_clones(
