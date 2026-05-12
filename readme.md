@@ -19,6 +19,17 @@
 |---|---|
 | ![aik hub](./assets/aik-hub.png) | ![CC Clean TUI](./assets/cc-clean-tui.png) |
 
+<details>
+<summary>更多 CLI 截图（Codex Session Toolkit 命令列表 / CC Clean 可清理目标）</summary>
+
+### `aik codex --help` —— Codex 会话工具箱的全部子命令
+![codex --help](./assets/cli-codex-help.png)
+
+### `aik claude list-targets` —— CC Clean 可清理的本地标识 / 遥测 / 缓存 / 历史目标键（清理前自动备份）
+![claude list-targets](./assets/cli-claude-targets.png)
+
+</details>
+
 ## 选哪种运行方式？
 
 | 方式 | 命令 | 需要安装吗？ | 会在 PATH 里多命令吗？ |
