@@ -11,6 +11,10 @@
 
 ![界面预览](./assets/12345.png)
 
+命令总览（`aik --help` / `aik claude --help`）：
+
+![CLI 总览](./assets/cli-overview.png)
+
 | `aik` 顶层 hub | CC Clean 子工具 |
 |---|---|
 | ![aik hub](./assets/aik-hub.png) | ![CC Clean TUI](./assets/cc-clean-tui.png) |
