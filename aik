@@ -65,10 +65,31 @@ if [ -z "$PYTHON_BIN" ]; then
   fi
 fi
 
+python_os_name() {
+  "$PYTHON_BIN" -c 'import os; print(os.name)' 2>/dev/null || printf '%s\n' "posix"
+}
+
+python_pathsep() {
+  "$PYTHON_BIN" -c 'import os; print(os.pathsep)' 2>/dev/null || printf '%s\n' ":"
+}
+
+python_import_path() {
+  path="$1"
+  py_os="$2"
+  if [ "$py_os" = "nt" ] && command -v cygpath >/dev/null 2>&1; then
+    cygpath -w "$path"
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
 echo "============================================="
 echo " AI CLI Kit - Launcher (Source Mode)"
 echo "============================================="
 echo ">> $PYTHON_BIN -m $PACKAGE_MODULE $*"
 
-export PYTHONPATH="$SRC_DIR${PYTHONPATH:+:$PYTHONPATH}"
+PYTHON_OS_NAME="$(python_os_name)"
+PYTHON_PATHSEP="$(python_pathsep)"
+PYTHON_SRC_DIR="$(python_import_path "$SRC_DIR" "$PYTHON_OS_NAME")"
+export PYTHONPATH="$PYTHON_SRC_DIR${PYTHONPATH:+$PYTHON_PATHSEP$PYTHONPATH}"
 exec "$PYTHON_BIN" -m "$PACKAGE_MODULE" "$@"
