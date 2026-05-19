@@ -74,6 +74,7 @@ def validate_jsonl_file(
         raise ToolkitError(f"Missing {file_label}: {file_path}")
 
     found_session_meta = False
+    found_expected_session_meta = False
     with file_path.open("r", encoding="utf-8") as fh:
         for line_number, raw in enumerate(fh, 1):
             stripped = raw.strip()
@@ -93,10 +94,8 @@ def validate_jsonl_file(
                     found_session_meta = True
                     payload = obj.get("payload")
                     payload_session_id = payload.get("id") if isinstance(payload, dict) else None
-                    if expected_session_id and payload_session_id and payload_session_id != expected_session_id:
-                        raise ToolkitError(
-                            f"{file_label} session_meta id does not match expected session id: {payload_session_id}"
-                        )
+                    if expected_session_id and payload_session_id == expected_session_id:
+                        found_expected_session_meta = True
             elif file_kind == "history":
                 session_id = obj.get("session_id")
                 if expected_session_id and session_id != expected_session_id:
@@ -104,8 +103,13 @@ def validate_jsonl_file(
                         f"{file_label} line {line_number} has unexpected session_id: {session_id}"
                     )
 
-    if file_kind == "session" and not found_session_meta:
-        raise ToolkitError(f"{file_label} does not contain a session_meta record.")
+    if file_kind == "session":
+        if expected_session_id and not found_expected_session_meta:
+            raise ToolkitError(
+                f"{file_label} does not contain session_meta for expected session id: {expected_session_id}"
+            )
+        if not expected_session_id and not found_session_meta:
+            raise ToolkitError(f"{file_label} does not contain a session_meta record.")
 
 
 def normalize_relative_path(relative_path: str) -> str:
