@@ -12,7 +12,7 @@ from . import APP_COMMAND, APP_DISPLAY_NAME, __version__
 from .commands import run_cli as run_toolkit_cli
 from .errors import ToolkitError
 from .paths import CodexPaths
-from .services.provider import detect_provider
+from .services.provider import DEFAULT_MODEL_PROVIDER, detect_provider
 from .tui.app import (
     ToolkitAppContext,
     run_cleanup_mode,
@@ -30,7 +30,6 @@ from .tui.terminal import (
 # Configuration
 CODEX_ACTIVE_SESSIONS_DIR = os.path.expanduser("~/.codex/sessions")
 CODEX_CONFIG_PATH = os.path.expanduser("~/.codex/config.toml")
-DEFAULT_MODEL_PROVIDER = "cliproxyapi"
 
 
 def _detect_target_model_provider() -> str:

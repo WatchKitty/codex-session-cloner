@@ -425,6 +425,25 @@ class IndexStoreHelperTests(unittest.TestCase):
             self.assertFalse(missing.exists())
 
 
+class ProviderDetectionTests(unittest.TestCase):
+    def test_detect_provider_defaults_to_openai_when_config_omits_model_provider(self) -> None:
+        from ai_cli_kit.codex.services.provider import detect_provider
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            code_dir = home / ".codex"
+            code_dir.mkdir(parents=True)
+            (code_dir / "config.toml").write_text(
+                'model = "gpt-5.5"\n'
+                'model_reasoning_effort = "xhigh"\n\n'
+                '[plugins."browser@openai-bundled"]\n'
+                "enabled = true\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(detect_provider(CodexPaths(home=home)), "openai")
+
+
 class CoreWorkflowTests(unittest.TestCase):
     def test_session_summaries_use_first_meaningful_user_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

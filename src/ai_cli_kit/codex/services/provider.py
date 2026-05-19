@@ -7,6 +7,8 @@ import re
 from ..errors import ToolkitError
 from ..paths import CodexPaths
 
+DEFAULT_MODEL_PROVIDER = "openai"
+
 try:
     import tomllib  # Python 3.11+
 except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
@@ -36,4 +38,4 @@ def detect_provider(paths: CodexPaths, explicit: str = "") -> str:
     if match:
         return match.group(1)
 
-    raise ToolkitError("Could not detect model_provider from ~/.codex/config.toml")
+    return DEFAULT_MODEL_PROVIDER
