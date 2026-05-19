@@ -94,6 +94,8 @@ python -m ai_cli_kit.claude
 ./aik codex export-desktop-all         # 批量导出 Desktop 会话
 ./aik codex import <session_id>        # 导入 Bundle
 ./aik codex clone-provider             # 切换 provider 后克隆
+./aik codex clean-archived --dry-run   # 预览清理已归档对话
+./aik codex clean-archived --yes       # 备份后清理已归档对话
 ./aik codex repair-desktop             # 修复 Desktop 可见性 / 索引
 ./aik codex --help                     # 完整子命令清单
 ```

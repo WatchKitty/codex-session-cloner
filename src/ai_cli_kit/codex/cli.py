@@ -42,6 +42,7 @@ def _detect_target_model_provider() -> str:
 TARGET_MODEL_PROVIDER = _detect_target_model_provider()
 CLI_SUBCOMMANDS = {
     "clone-provider",
+    "clean-archived",
     "clean-clones",
     "dedupe-clones",
     "list",
@@ -65,6 +66,7 @@ def create_arg_parser() -> argparse.ArgumentParser:
         epilog=(
             "Canonical toolkit commands:\n"
             "  clone-provider        Clone active sessions to the current provider\n"
+            "  clean-archived        Delete archived Codex threads with backup\n"
             "  clean-clones          Remove legacy unmarked clone files\n"
             "  dedupe-clones         Remove duplicate clone/original pairs conservatively\n"
             "  list                  Browse local sessions\n"

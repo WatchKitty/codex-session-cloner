@@ -18,6 +18,7 @@ if str(SRC_DIR) not in sys.path:
 from ai_cli_kit.codex.paths import CodexPaths  # noqa: E402
 from ai_cli_kit.codex.models import BundleSummary  # noqa: E402
 from ai_cli_kit.codex.services.browse import get_bundle_summaries, get_session_summaries, validate_bundles  # noqa: E402
+from ai_cli_kit.codex.services.archive_cleanup import clean_archived_sessions  # noqa: E402
 from ai_cli_kit.codex.services.clone import clone_to_provider  # noqa: E402
 from ai_cli_kit.codex.services.dedupe import dedupe_clones  # noqa: E402
 from ai_cli_kit.codex.services.exporting import export_active_desktop_all, export_session  # noqa: E402
@@ -25,7 +26,7 @@ from ai_cli_kit.codex.services.importing import import_desktop_all, import_sessi
 from ai_cli_kit.codex.services.repair import repair_desktop  # noqa: E402
 from ai_cli_kit.codex.support import machine_label_to_key  # noqa: E402
 from ai_cli_kit.codex.stores.bundles import collect_known_bundle_summaries, latest_distinct_bundle_summaries  # noqa: E402
-from ai_cli_kit.codex.stores.index import load_existing_index  # noqa: E402
+from ai_cli_kit.codex.stores.index import load_existing_index, upsert_session_index  # noqa: E402
 from ai_cli_kit.codex.stores.session_files import iter_session_files, read_session_payload  # noqa: E402
 from ai_cli_kit.codex.validation import load_manifest, validate_relative_path  # noqa: E402
 
@@ -112,6 +113,44 @@ def create_threads_db(home: Path) -> Path:
     conn.commit()
     conn.close()
     return db_path
+
+
+def insert_thread_row(db_path: Path, session_id: str, rollout_path: Path, *, archived: bool, cwd: Path) -> None:
+    conn = sqlite3.connect(db_path)
+    columns = [row[1] for row in conn.execute("pragma table_info(threads)").fetchall()]
+    values = {
+        "id": session_id,
+        "rollout_path": str(rollout_path),
+        "created_at": 1770000000,
+        "updated_at": 1770000100,
+        "source": "vscode",
+        "model_provider": "openai",
+        "cwd": str(cwd),
+        "title": session_id,
+        "sandbox_policy": "{}",
+        "approval_mode": "never",
+        "tokens_used": 0,
+        "has_user_event": 1,
+        "archived": 1 if archived else 0,
+        "archived_at": 1770000200 if archived else None,
+        "git_sha": None,
+        "git_branch": None,
+        "git_origin_url": None,
+        "cli_version": "0.1.0",
+        "first_user_message": "hello",
+        "memory_mode": "enabled",
+        "model": "gpt-5",
+        "reasoning_effort": "medium",
+        "thread_source": "user",
+        "preview": "hello",
+    }
+    selected = [column for column in columns if column in values]
+    conn.execute(
+        f"insert into threads ({','.join(selected)}) values ({','.join('?' for _ in selected)})",
+        [values[column] for column in selected],
+    )
+    conn.commit()
+    conn.close()
 
 
 def write_history(home: Path, session_id: str, text: str) -> None:
@@ -450,6 +489,203 @@ class ProviderDetectionTests(unittest.TestCase):
 
 
 class CoreWorkflowTests(unittest.TestCase):
+    def test_clean_archived_dry_run_does_not_modify_files_or_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir()
+            paths = CodexPaths(home=home, cwd=workspace)
+            write_config(home, "openai")
+            state_db = create_threads_db(home)
+
+            archived_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+            archived_file = write_session(
+                home,
+                archived_id,
+                provider="openai",
+                source="vscode",
+                originator="Codex Desktop",
+                cwd=workspace,
+                archived=True,
+            )
+            insert_thread_row(state_db, archived_id, archived_file, archived=True, cwd=workspace)
+            upsert_session_index(paths.index_file, archived_id, "archived", "2026-04-10T10:00:00Z")
+
+            result = clean_archived_sessions(paths, dry_run=True)
+
+            self.assertTrue(result.dry_run)
+            self.assertEqual(result.archived_thread_ids, [archived_id])
+            self.assertTrue(archived_file.exists())
+            self.assertIn(archived_id, load_existing_index(paths.index_file))
+            conn = sqlite3.connect(state_db)
+            try:
+                count = conn.execute("select count(*) from threads where id = ?", (archived_id,)).fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(count, 1)
+
+    def test_clean_archived_deletes_files_and_prunes_desktop_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir()
+            paths = CodexPaths(home=home, cwd=workspace)
+            write_config(home, "openai")
+            state_db = create_threads_db(home)
+            conn = sqlite3.connect(state_db)
+            conn.execute("create table thread_dynamic_tools (thread_id text, position integer)")
+            conn.execute("create table thread_spawn_edges (parent_thread_id text, child_thread_id text, status text)")
+            conn.commit()
+            conn.close()
+
+            archived_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+            active_id = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+            archived_file = write_session(
+                home,
+                archived_id,
+                provider="openai",
+                source="vscode",
+                originator="Codex Desktop",
+                cwd=workspace,
+                archived=True,
+            )
+            active_file = write_session(
+                home,
+                active_id,
+                provider="openai",
+                source="vscode",
+                originator="Codex Desktop",
+                cwd=workspace,
+                archived=False,
+            )
+            lock_file = archived_file.with_suffix(archived_file.suffix + ".lock")
+            lock_file.write_text("", encoding="utf-8")
+
+            insert_thread_row(state_db, archived_id, archived_file, archived=True, cwd=workspace)
+            insert_thread_row(state_db, active_id, active_file, archived=False, cwd=workspace)
+            conn = sqlite3.connect(state_db)
+            conn.execute("insert into thread_dynamic_tools values (?, ?)", (archived_id, 0))
+            conn.execute("insert into thread_dynamic_tools values (?, ?)", (active_id, 0))
+            conn.execute("insert into thread_spawn_edges values (?, ?, ?)", (archived_id, active_id, "done"))
+            conn.commit()
+            conn.close()
+
+            upsert_session_index(paths.index_file, archived_id, "archived", "2026-04-10T10:00:00Z")
+            upsert_session_index(paths.index_file, active_id, "active", "2026-04-10T10:00:00Z")
+            paths.state_file.write_text(
+                json.dumps(
+                    {
+                        "thread-workspace-root-hints": {archived_id: "gone", active_id: "keep"},
+                        "projectless-thread-ids": [archived_id, active_id],
+                        "electron-persisted-atom-state": {
+                            "thread-workspace-root-hints": {archived_id: "gone", active_id: "keep"},
+                            "thread-titles": {"titles": {archived_id: "gone", active_id: "keep"}},
+                            "prompt-history": {archived_id: ["gone"], active_id: ["keep"], "new-conversation": []},
+                            "heartbeat-thread-permissions-by-id": {archived_id: {}, active_id: {}},
+                            f"app-shell:right-panel-width:v2:/local/:{archived_id}": 0.5,
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
+
+            result = clean_archived_sessions(paths, dry_run=False)
+
+            self.assertFalse(archived_file.exists())
+            self.assertFalse(lock_file.exists())
+            self.assertTrue(active_file.exists())
+            self.assertIn(archived_file, result.deleted_files)
+            self.assertIn(lock_file, result.deleted_lock_files)
+            self.assertIsNotNone(result.backup_root)
+            self.assertTrue((result.backup_root / archived_file.relative_to(paths.code_dir)).exists())
+            self.assertTrue((result.backup_root / paths.index_file.relative_to(paths.code_dir)).exists())
+            self.assertNotIn(archived_id, load_existing_index(paths.index_file))
+            self.assertIn(active_id, load_existing_index(paths.index_file))
+
+            conn = sqlite3.connect(state_db)
+            try:
+                archived_count = conn.execute("select count(*) from threads where id = ?", (archived_id,)).fetchone()[0]
+                active_count = conn.execute("select count(*) from threads where id = ?", (active_id,)).fetchone()[0]
+                dynamic_count = conn.execute("select count(*) from thread_dynamic_tools where thread_id = ?", (archived_id,)).fetchone()[0]
+                edge_count = conn.execute("select count(*) from thread_spawn_edges where parent_thread_id = ?", (archived_id,)).fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(archived_count, 0)
+            self.assertEqual(active_count, 1)
+            self.assertEqual(dynamic_count, 0)
+            self.assertEqual(edge_count, 0)
+
+            state = json.loads(paths.state_file.read_text(encoding="utf-8"))
+            self.assertNotIn(archived_id, state["thread-workspace-root-hints"])
+            self.assertIn(active_id, state["thread-workspace-root-hints"])
+            atom_state = state["electron-persisted-atom-state"]
+            self.assertNotIn(archived_id, atom_state["prompt-history"])
+            self.assertNotIn(archived_id, atom_state["heartbeat-thread-permissions-by-id"])
+            self.assertFalse(any(archived_id in key for key in atom_state.keys()))
+            self.assertIn(active_id, atom_state["prompt-history"])
+
+    def test_clean_archived_keeps_metadata_for_matching_active_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir()
+            paths = CodexPaths(home=home, cwd=workspace)
+            write_config(home, "openai")
+            state_db = create_threads_db(home)
+
+            session_id = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+            archived_file = write_session(
+                home,
+                session_id,
+                provider="openai",
+                source="vscode",
+                originator="Codex Desktop",
+                cwd=workspace,
+                archived=True,
+            )
+            active_file = write_session(
+                home,
+                session_id,
+                provider="openai",
+                source="vscode",
+                originator="Codex Desktop",
+                cwd=workspace,
+                archived=False,
+            )
+            insert_thread_row(state_db, session_id, active_file, archived=False, cwd=workspace)
+            upsert_session_index(paths.index_file, session_id, "active", "2026-04-10T10:00:00Z")
+            paths.state_file.write_text(
+                json.dumps(
+                    {
+                        "thread-workspace-root-hints": {session_id: "keep"},
+                        "electron-persisted-atom-state": {
+                            "prompt-history": {session_id: ["keep"]},
+                            "heartbeat-thread-permissions-by-id": {session_id: {}},
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
+
+            result = clean_archived_sessions(paths, dry_run=False)
+
+            self.assertFalse(archived_file.exists())
+            self.assertTrue(active_file.exists())
+            self.assertEqual(result.deleted_session_ids, [])
+            self.assertTrue(any("skipped metadata cleanup" in warning for warning in result.warnings))
+            self.assertIn(session_id, load_existing_index(paths.index_file))
+            conn = sqlite3.connect(state_db)
+            try:
+                count = conn.execute("select count(*) from threads where id = ? and archived = 0", (session_id,)).fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(count, 1)
+            state = json.loads(paths.state_file.read_text(encoding="utf-8"))
+            self.assertIn(session_id, state["thread-workspace-root-hints"])
+            self.assertIn(session_id, state["electron-persisted-atom-state"]["prompt-history"])
+
     def test_session_summaries_use_first_meaningful_user_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir) / "home"

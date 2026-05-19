@@ -71,6 +71,8 @@ class PackagingSmokeTests(unittest.TestCase):
                 "clone",
                 "clone_dry",
                 "clean",
+                "clean_archived",
+                "clean_archived_dry",
                 "clean_dry",
                 "dedupe",
                 "dedupe_dry",

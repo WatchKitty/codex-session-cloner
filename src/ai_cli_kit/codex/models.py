@@ -83,6 +83,22 @@ class DedupeResult:
 
 
 @dataclass(frozen=True)
+class ArchivedCleanupResult:
+    dry_run: bool
+    files_checked: int
+    archived_files: List[Path]
+    archived_thread_ids: List[str]
+    deleted_session_ids: List[str] = field(default_factory=list)
+    deleted_files: List[Path] = field(default_factory=list)
+    deleted_lock_files: List[Path] = field(default_factory=list)
+    threads_deleted: int = 0
+    global_state_pruned: bool = False
+    backup_root: Optional[Path] = None
+    errors: List[Tuple[Path, str]] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class ValidationReport:
     source_group: str
     results: List[BundleValidationResult]

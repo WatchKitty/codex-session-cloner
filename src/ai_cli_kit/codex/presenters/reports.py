@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 
 from ..models import (
+    ArchivedCleanupResult,
     BatchExportResult,
     BatchImportResult,
     BundleSummary,
@@ -132,6 +133,39 @@ def print_dedupe_result(result: DedupeResult) -> int:
         print(f"Backup directory: {result.backup_root}")
     if result.deleted_session_ids:
         print(f"Deleted session ids: {len(result.deleted_session_ids)}")
+    if result.errors:
+        print("Errors:", file=sys.stderr)
+        for path, reason in result.errors:
+            print(f"{path}: {reason}", file=sys.stderr)
+    return 1 if result.errors else 0
+
+
+def print_archived_cleanup_result(result: ArchivedCleanupResult) -> int:
+    print(f"Dry run: {'yes' if result.dry_run else 'no'}")
+    print(f"Archived rollout files found: {len(result.archived_files)}")
+    print(f"Archived thread ids found: {len(result.archived_thread_ids)}")
+
+    for target_path in result.archived_files[:30]:
+        action_prefix = "[DRY-RUN] Would delete" if result.dry_run else "[Deleted]"
+        if result.dry_run or target_path in result.deleted_files:
+            print(f"{action_prefix} {target_path}")
+
+    if len(result.archived_files) > 30:
+        print(f"... and {len(result.archived_files) - 30} more")
+
+    if result.backup_root is not None:
+        print(f"Backup directory: {result.backup_root}")
+    if result.deleted_session_ids:
+        print(f"Deleted session ids: {len(result.deleted_session_ids)}")
+    if result.deleted_lock_files:
+        print(f"Deleted lock files: {len(result.deleted_lock_files)}")
+    if result.threads_deleted:
+        print(f"SQLite rows deleted: {result.threads_deleted}")
+    print(f"Global state pruned: {'yes' if result.global_state_pruned else 'no'}")
+    if result.warnings:
+        print("Warnings:", file=sys.stderr)
+        for warning in result.warnings:
+            print(warning, file=sys.stderr)
     if result.errors:
         print("Errors:", file=sys.stderr)
         for path, reason in result.errors:

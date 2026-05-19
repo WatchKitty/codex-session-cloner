@@ -10,6 +10,7 @@ from . import APP_COMMAND
 from .errors import ToolkitError
 from .paths import CodexPaths
 from .presenters.reports import (
+    print_archived_cleanup_result,
     print_batch_export_result,
     print_batch_import_result,
     print_bundle_rows,
@@ -23,6 +24,7 @@ from .presenters.reports import (
     print_validation_report,
 )
 from .services.browse import get_bundle_summaries, get_session_summaries, validate_bundles
+from .services.archive_cleanup import clean_archived_sessions
 from .services.clone import cleanup_clones, clone_to_provider
 from .services.dedupe import dedupe_clones
 from .services.exporting import export_active_desktop_all, export_cli_all, export_desktop_all, export_session
@@ -75,6 +77,10 @@ def create_parser() -> argparse.ArgumentParser:
     clean_parser = subparsers.add_parser("clean-clones", help="Delete legacy unmarked clone files")
     clean_parser.add_argument("target_provider", nargs="?", default="", help="Optional provider override")
     clean_parser.add_argument("--dry-run", action="store_true")
+
+    archived_clean_parser = subparsers.add_parser("clean-archived", help="Delete archived Codex threads safely")
+    archived_clean_parser.add_argument("--dry-run", action="store_true")
+    archived_clean_parser.add_argument("--yes", action="store_true", help="Confirm destructive cleanup")
 
     dedupe_parser = subparsers.add_parser(
         "dedupe-clones",
@@ -155,6 +161,10 @@ def run_cli(argv: Sequence[str], *, paths: Optional[CodexPaths] = None) -> int:
         return print_clone_run_result(clone_to_provider(paths, target_provider=args.target_provider, dry_run=args.dry_run))
     if args.command == "clean-clones":
         return print_cleanup_result(cleanup_clones(paths, target_provider=args.target_provider, dry_run=args.dry_run))
+    if args.command == "clean-archived":
+        if not args.dry_run and not args.yes:
+            raise ToolkitError("clean-archived deletes archived threads. Re-run with --dry-run first, or pass --yes to confirm.")
+        return print_archived_cleanup_result(clean_archived_sessions(paths, dry_run=args.dry_run))
     if args.command == "dedupe-clones":
         return print_dedupe_result(dedupe_clones(paths, target_provider=args.target_provider, dry_run=args.dry_run))
     if args.command == "export":

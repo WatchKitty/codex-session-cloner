@@ -116,6 +116,8 @@ TUI_ACTION_NOTES = {
     "clone_dry": ["只预览将创建哪些 clone，不写入任何文件。"],
     "clean": ["删除早期版本生成、但没有 cloned_from 标记的旧副本。", "执行前需要输入 DELETE 二次确认。"],
     "clean_dry": ["只预览哪些旧副本会被删除。"],
+    "clean_archived": ["删除已归档的 Codex 线程，并同步清理 index / threads / global state。", "执行前会备份并需要输入 DELETE 二次确认。"],
+    "clean_archived_dry": ["只预览哪些归档线程会被删除。"],
     "list_sessions": ["内置会话浏览器，支持搜索、预览和详情查看。"],
     "browse_bundles": ["独立浏览 Bundle 导出记录，而不是只在导入时顺手选择。", "默认显示全部历史，支持按导出方式、机器和最新视图切换。"],
     "validate_bundles": ["扫描 Bundle 导出目录里的 manifest、session JSONL 和 history JSONL。", "适合在批量导入前先找出坏包。"],
@@ -165,8 +167,10 @@ def build_tui_menu_actions() -> List[TuiMenuAction]:
         TuiMenuAction("clone_dry", "2", "模拟克隆（Dry-run）", "repair", ("clone-provider", "--dry-run"), is_dry_run=True),
         TuiMenuAction("clean", "3", "清理旧版无标记副本", "repair", ("clean-clones",), is_dangerous=True),
         TuiMenuAction("clean_dry", "4", "模拟清理旧版副本", "repair", ("clean-clones", "--dry-run"), is_dangerous=True, is_dry_run=True),
-        TuiMenuAction("dedupe", "5", "去重重复 clone（保守）", "repair", ("dedupe-clones",), is_dangerous=True),
-        TuiMenuAction("dedupe_dry", "6", "模拟去重 clone", "repair", ("dedupe-clones", "--dry-run"), is_dangerous=True, is_dry_run=True),
+        TuiMenuAction("clean_archived", "5", "清理已归档线程", "repair", ("clean-archived", "--yes"), is_dangerous=True),
+        TuiMenuAction("clean_archived_dry", "6", "模拟清理归档线程", "repair", ("clean-archived", "--dry-run"), is_dangerous=True, is_dry_run=True),
+        TuiMenuAction("dedupe", "7", "去重重复 clone（保守）", "repair", ("dedupe-clones",), is_dangerous=True),
+        TuiMenuAction("dedupe_dry", "8", "模拟去重 clone", "repair", ("dedupe-clones", "--dry-run"), is_dangerous=True, is_dry_run=True),
         TuiMenuAction("repair_desktop", "r", "修复 Desktop 可见性", "repair", ("repair-desktop",)),
         TuiMenuAction("repair_desktop_dry", "v", "模拟修复 Desktop", "repair", ("repair-desktop", "--dry-run"), is_dry_run=True),
         TuiMenuAction("repair_desktop_cli", "x", "修复并纳入 CLI 线程", "repair", ("repair-desktop", "--include-cli")),
@@ -1320,6 +1324,7 @@ class ToolkitTuiApp:
             "",
             style_text("常用 CLI（更完整的工具链能力）：", Ansi.BOLD),
             "  clone-provider                克隆活动会话到当前 provider",
+            "  clean-archived --dry-run      预览清理已归档 Codex 线程",
             "  clean-clones                  清理旧版无标记副本",
             "  list [pattern]                列出本机会话",
             "  list-bundles [pattern]        列出 Bundle 导出记录",
@@ -1636,6 +1641,9 @@ class ToolkitTuiApp:
 
         action_name, cli_args = self._resolve_menu_action_request(chosen_action)
         if cli_args is not None:
+            if chosen_action.is_dangerous and not chosen_action.is_dry_run:
+                if not self._confirm_dangerous_action(cli_args):
+                    return
             self._run_action(
                 action_name or chosen_action.label,
                 cli_args,
@@ -1684,10 +1692,16 @@ class ToolkitTuiApp:
 
     def _confirm_dangerous_action(self, cli_args: Sequence[str]) -> bool:
         box_width = self._print_branded_header("危险操作确认", "该操作会删除文件，且无法恢复。")
+        if cli_args and cli_args[0] == "clean-archived":
+            action_text = "Clean Archived 会删除已归档线程，并同步清理 index / threads / global state。"
+            scope_text = "已归档 Codex 线程"
+        else:
+            action_text = "Clean 会删除旧版无标记副本文件。"
+            scope_text = "旧版无标记 clone 文件"
         info_lines = [
-            style_text(f"{glyphs().get('danger', '!!')} 【危险】", Ansi.BOLD, Ansi.RED) + " Clean 会删除旧版无标记副本文件。",
+            style_text(f"{glyphs().get('danger', '!!')} 【危险】", Ansi.BOLD, Ansi.RED) + f" {action_text}",
             f"{style_text('执行方式', Ansi.DIM)} : 直接在 TUI 中执行",
-            f"{style_text('影响范围', Ansi.DIM)} : 旧版无标记 clone 文件",
+            f"{style_text('影响范围', Ansi.DIM)} : {scope_text}",
             "",
             "确认方式：输入 DELETE 并回车。",
             "取消方式：直接回车。",
