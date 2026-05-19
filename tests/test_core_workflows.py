@@ -623,6 +623,135 @@ class CoreWorkflowTests(unittest.TestCase):
             self.assertFalse(any(archived_id in key for key in atom_state.keys()))
             self.assertIn(active_id, atom_state["prompt-history"])
 
+    def test_clean_archived_deletes_subagents_owned_by_archived_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir()
+            paths = CodexPaths(home=home, cwd=workspace)
+            write_config(home, "openai")
+            state_db = create_threads_db(home)
+
+            parent_id = "11111111-1111-1111-1111-111111111111"
+            child_id = "22222222-2222-2222-2222-222222222222"
+            grandchild_id = "33333333-3333-3333-3333-333333333333"
+            unrelated_id = "44444444-4444-4444-4444-444444444444"
+            parent_file = write_session(
+                home,
+                parent_id,
+                provider="openai",
+                source="vscode",
+                originator="Codex Desktop",
+                cwd=workspace,
+                archived=True,
+            )
+            child_file = write_session(
+                home,
+                child_id,
+                provider="openai",
+                source={"subagent": {"thread_spawn": {"parent_thread_id": parent_id, "agent_role": "explorer"}}},
+                originator="Codex Desktop",
+                cwd=workspace,
+            )
+            grandchild_file = write_session(
+                home,
+                grandchild_id,
+                provider="openai",
+                source={"subagent": {"thread_spawn": {"parent_thread_id": child_id, "agent_role": "worker"}}},
+                originator="Codex Desktop",
+                cwd=workspace,
+            )
+            unrelated_file = write_session(
+                home,
+                unrelated_id,
+                provider="openai",
+                source="vscode",
+                originator="Codex Desktop",
+                cwd=workspace,
+            )
+
+            for session_id, rollout_path, archived in [
+                (parent_id, parent_file, True),
+                (child_id, child_file, False),
+                (grandchild_id, grandchild_file, False),
+                (unrelated_id, unrelated_file, False),
+            ]:
+                insert_thread_row(state_db, session_id, rollout_path, archived=archived, cwd=workspace)
+                upsert_session_index(paths.index_file, session_id, session_id, "2026-04-10T10:00:00Z")
+
+            paths.state_file.write_text(
+                json.dumps(
+                    {
+                        "thread-workspace-root-hints": {
+                            parent_id: "gone",
+                            child_id: "gone",
+                            grandchild_id: "gone",
+                            unrelated_id: "keep",
+                        },
+                        "projectless-thread-ids": [parent_id, child_id, grandchild_id, unrelated_id],
+                        "electron-persisted-atom-state": {
+                            "prompt-history": {
+                                parent_id: ["gone"],
+                                child_id: ["gone"],
+                                grandchild_id: ["gone"],
+                                unrelated_id: ["keep"],
+                                "new-conversation": [],
+                            },
+                            "heartbeat-thread-permissions-by-id": {
+                                parent_id: {},
+                                child_id: {},
+                                grandchild_id: {},
+                                unrelated_id: {},
+                            },
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
+
+            result = clean_archived_sessions(paths, dry_run=False)
+
+            self.assertFalse(parent_file.exists())
+            self.assertFalse(child_file.exists())
+            self.assertFalse(grandchild_file.exists())
+            self.assertTrue(unrelated_file.exists())
+            self.assertEqual(set(result.deleted_session_ids), {parent_id, child_id, grandchild_id})
+            self.assertEqual(set(result.subagent_files), {child_file, grandchild_file})
+
+            index_entries = load_existing_index(paths.index_file)
+            self.assertNotIn(parent_id, index_entries)
+            self.assertNotIn(child_id, index_entries)
+            self.assertNotIn(grandchild_id, index_entries)
+            self.assertIn(unrelated_id, index_entries)
+
+            conn = sqlite3.connect(state_db)
+            try:
+                deleted_count = conn.execute(
+                    "select count(*) from threads where id in (?, ?, ?)",
+                    (parent_id, child_id, grandchild_id),
+                ).fetchone()[0]
+                unrelated_count = conn.execute(
+                    "select count(*) from threads where id = ?",
+                    (unrelated_id,),
+                ).fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(deleted_count, 0)
+            self.assertEqual(unrelated_count, 1)
+
+            state = json.loads(paths.state_file.read_text(encoding="utf-8"))
+            self.assertNotIn(parent_id, state["thread-workspace-root-hints"])
+            self.assertNotIn(child_id, state["thread-workspace-root-hints"])
+            self.assertNotIn(grandchild_id, state["thread-workspace-root-hints"])
+            self.assertIn(unrelated_id, state["thread-workspace-root-hints"])
+            self.assertNotIn(child_id, state["projectless-thread-ids"])
+            atom_state = state["electron-persisted-atom-state"]
+            self.assertNotIn(parent_id, atom_state["prompt-history"])
+            self.assertNotIn(child_id, atom_state["prompt-history"])
+            self.assertNotIn(grandchild_id, atom_state["prompt-history"])
+            self.assertIn(unrelated_id, atom_state["prompt-history"])
+
     def test_clean_archived_keeps_metadata_for_matching_active_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir) / "home"

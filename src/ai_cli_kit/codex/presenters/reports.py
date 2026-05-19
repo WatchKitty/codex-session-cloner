@@ -144,14 +144,22 @@ def print_archived_cleanup_result(result: ArchivedCleanupResult) -> int:
     print(f"Dry run: {'yes' if result.dry_run else 'no'}")
     print(f"Archived rollout files found: {len(result.archived_files)}")
     print(f"Archived thread ids found: {len(result.archived_thread_ids)}")
+    if result.subagent_files:
+        print(f"Subagent rollout files owned by archived threads: {len(result.subagent_files)}")
 
     for target_path in result.archived_files[:30]:
         action_prefix = "[DRY-RUN] Would delete" if result.dry_run else "[Deleted]"
         if result.dry_run or target_path in result.deleted_files:
             print(f"{action_prefix} {target_path}")
+    for target_path in result.subagent_files[:30]:
+        action_prefix = "[DRY-RUN] Would delete subagent" if result.dry_run else "[Deleted subagent]"
+        if result.dry_run or target_path in result.deleted_files:
+            print(f"{action_prefix} {target_path}")
 
     if len(result.archived_files) > 30:
         print(f"... and {len(result.archived_files) - 30} more")
+    if len(result.subagent_files) > 30:
+        print(f"... and {len(result.subagent_files) - 30} more subagent files")
 
     if result.deleted_session_ids:
         print(f"Deleted session ids: {len(result.deleted_session_ids)}")

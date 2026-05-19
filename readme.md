@@ -146,11 +146,12 @@ python -m ai_cli_kit.claude
 执行时会删除：
 
 - `~/.codex/archived_sessions/` 下的归档 rollout JSONL 与对应 `.lock` 文件
+- 这些归档线程创建的 subagent rollout JSONL 与对应 `.lock` 文件（即使 Codex 没有把父子关系写入 `thread_spawn_edges`）
 - `~/.codex/session_index.jsonl` 中这些归档 session id 的索引项
 - 最新 `~/.codex/state_*.sqlite` 中这些归档线程的 Desktop 元数据行（包括 `threads`、`thread_dynamic_tools` 等相关表）
 - `.codex-global-state.json` 中这些线程对应的 workspace hints、prompt-history、heartbeat 权限等残留
 
-注意：`clean-archived` 不创建备份，也没有 restore 子命令；真实删除必须显式传 `--yes`。如果某个 session id 同时仍存在于 `~/.codex/sessions/`，工具只删除归档目录里的残留文件，不清理 active 线程的 index / sqlite / global state 元数据。
+注意：`clean-archived` 不创建备份，也没有 restore 子命令；真实删除必须显式传 `--yes`。如果某个 session id 同时仍存在于 `~/.codex/sessions/`，工具只删除归档目录里的残留文件，不清理 active 线程的 index / sqlite / global state 元数据；但如果 active 文件是被该归档线程创建的 subagent，工具会把它作为归档父线程的一部分一起清理。
 
 兼容写法：把 `./aik codex` 换成 `./codex-session-toolkit` 即可，参数完全一致。
 
