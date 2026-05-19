@@ -149,7 +149,8 @@ def upsert_threads_table(
     if not state_db or not state_db.is_file():
         return False
 
-    meta: dict = {}
+    first_meta: dict = {}
+    matched_meta: dict = {}
     turn_context: dict = {}
     last_timestamp = ""
 
@@ -162,14 +163,21 @@ def upsert_threads_table(
                 obj = json.loads(stripped)
             except Exception as exc:
                 raise ToolkitError(f"Failed to parse prepared session file at line {line_number}: {exc}") from exc
+            if not isinstance(obj, dict):
+                continue
             timestamp = obj.get("timestamp")
             if isinstance(timestamp, str) and timestamp:
                 last_timestamp = timestamp
             if obj.get("type") == "session_meta" and isinstance(obj.get("payload"), dict):
-                meta = obj.get("payload", {})
+                payload = dict(obj["payload"])
+                if not first_meta:
+                    first_meta = payload
+                if payload.get("id") == session_id:
+                    matched_meta = payload
             elif obj.get("type") == "turn_context" and not turn_context and isinstance(obj.get("payload"), dict):
                 turn_context = obj.get("payload", {})
 
+    meta = matched_meta or first_meta
     history_preview = first_history_messages(history_file).get(session_id, "")
 
     source_name = _string_field(session_source) or _string_field(meta.get("source", ""))
@@ -190,6 +198,18 @@ def upsert_threads_table(
     cli_version = _string_field(meta.get("cli_version", ""))
     model = _sqlite_value(turn_context.get("model"))
     reasoning_effort = _sqlite_value(turn_context.get("effort"))
+    git = meta.get("git") if isinstance(meta.get("git"), dict) else {}
+    git_branch = _string_field(meta.get("git_branch")) or _string_field(git.get("branch"))
+    git_sha = (
+        _string_field(meta.get("git_sha"))
+        or _string_field(git.get("sha"))
+        or _string_field(git.get("commit"))
+    )
+    git_origin_url = (
+        _string_field(meta.get("git_origin_url"))
+        or _string_field(git.get("origin_url"))
+        or _string_field(git.get("origin"))
+    )
     archived = 1 if "archived_sessions" in target_rollout.parts else 0
     archived_at = iso_to_epoch(updated_iso) if archived else None
 
@@ -219,9 +239,14 @@ def upsert_threads_table(
             "archived_at": archived_at,
             "cli_version": cli_version,
             "first_user_message": first_user_message or title,
+            "git_sha": git_sha,
+            "git_branch": git_branch,
+            "git_origin_url": git_origin_url,
             "memory_mode": "enabled",
             "model": model,
             "reasoning_effort": reasoning_effort,
+            "thread_source": _string_field(meta.get("thread_source")),
+            "preview": first_user_message or title,
         }
 
         insert_cols = [c for c in data if c in columns]

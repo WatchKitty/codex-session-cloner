@@ -96,11 +96,16 @@ def create_threads_db(home: Path) -> Path:
             has_user_event integer,
             archived integer,
             archived_at integer,
+            git_sha text,
+            git_branch text,
+            git_origin_url text,
             cli_version text,
             first_user_message text,
             memory_mode text,
             model text,
-            reasoning_effort text
+            reasoning_effort text,
+            thread_source text,
+            preview text
         )
         """
     )
@@ -910,6 +915,94 @@ class CoreWorkflowTests(unittest.TestCase):
             conn.close()
             self.assertEqual(row, ("vscode", "target-provider", str(missing_cwd)))
 
+    def test_export_import_branch_rollout_with_embedded_parent_session_meta(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            src_home = Path(tmpdir) / "src_home"
+            dst_home = Path(tmpdir) / "dst_home"
+            workspace.mkdir()
+            write_config(src_home, "source-provider")
+            write_config(dst_home, "target-provider")
+            write_state_file(dst_home)
+            create_threads_db(dst_home)
+
+            parent_id = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+            child_id = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"
+            parent_rollout = write_session(
+                src_home,
+                parent_id,
+                provider="source-provider",
+                source="vscode",
+                originator="Codex Desktop",
+                cwd=workspace,
+                timestamp="2026-04-10T09:00:00Z",
+            )
+            child_rollout = write_session(
+                src_home,
+                child_id,
+                provider="source-provider",
+                source="vscode",
+                originator="Codex Desktop",
+                cwd=workspace,
+                timestamp="2026-04-10T10:00:00Z",
+                user_message="continue on a local branch",
+            )
+            write_history(src_home, child_id, "branch child history")
+
+            parent_payload = read_session_payload(parent_rollout)
+            child_payload = read_session_payload(child_rollout)
+            child_payload["forked_from_id"] = parent_id
+            child_payload["thread_source"] = "user"
+            child_payload["git"] = {"branch": "codex/child-branch"}
+            with child_rollout.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(
+                        {
+                            "timestamp": "2026-04-10T10:07:00Z",
+                            "type": "session_meta",
+                            "payload": parent_payload,
+                        },
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
+                fh.write(
+                    json.dumps(
+                        {
+                            "timestamp": "2026-04-10T10:08:00Z",
+                            "type": "session_meta",
+                            "payload": child_payload,
+                        },
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
+
+            src_paths = CodexPaths(home=src_home, cwd=workspace)
+            dst_paths = CodexPaths(home=dst_home, cwd=workspace)
+
+            with pushd(workspace):
+                export_result = export_session(src_paths, child_id)
+                validation = validate_bundles(src_paths, source_group="bundle")
+                import_result = import_session(dst_paths, str(export_result.bundle_dir), desktop_visible=True)
+
+            self.assertEqual(validation.invalid_results, [])
+            self.assertTrue(import_result.thread_row_upserted)
+
+            imported_rollout = dst_home / ".codex" / export_result.relative_path
+            imported_payload = read_session_payload(imported_rollout)
+            self.assertEqual(imported_payload["id"], child_id)
+            self.assertEqual(imported_payload["forked_from_id"], parent_id)
+            self.assertEqual(imported_payload["git"], {"branch": "codex/child-branch"})
+
+            conn = sqlite3.connect(dst_home / ".codex" / "state_0001.sqlite")
+            row = conn.execute(
+                "select git_branch, thread_source from threads where id = ?",
+                (child_id,),
+            ).fetchone()
+            conn.close()
+            self.assertEqual(row, ("codex/child-branch", "user"))
+
     def test_repair_desktop_rebuilds_index_and_converts_cli_threads(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Path(tmpdir) / "workspace"
@@ -1136,7 +1229,7 @@ class CoreWorkflowTests(unittest.TestCase):
             )
             write_history(home, session_id, "normalize manifest path")
 
-            paths = CodexPaths(home=home)
+            paths = CodexPaths(home=home, cwd=workspace)
             with pushd(workspace), env_override("CST_MACHINE_LABEL", "Win-Machine"):
                 result = export_session(paths, session_id)
 

@@ -227,7 +227,8 @@ def parse_jsonl_records(path: Path) -> List[Tuple[str, Optional[dict]]]:
     return records
 
 
-def read_session_payload(path: Path) -> dict:
+def _session_meta_payloads(path: Path) -> List[dict]:
+    payloads: List[dict] = []
     try:
         with path.open("r", encoding="utf-8") as fh:
             for line_number, raw in enumerate(fh, 1):
@@ -245,11 +246,34 @@ def read_session_payload(path: Path) -> dict:
                 payload = obj.get("payload")
                 if not isinstance(payload, dict):
                     raise ToolkitError(f"{path} line {line_number}: session_meta payload is not an object")
-                return dict(payload)
+                payloads.append(dict(payload))
     except FileNotFoundError as exc:
         raise ToolkitError(f"Missing file: {path}") from exc
+    return payloads
 
+
+def select_effective_session_payload(path: Path) -> dict:
+    """Return the latest session_meta payload for this rollout's own id.
+
+    Codex branch/fork rollouts may embed parent ``session_meta`` records before
+    or after the child metadata.  The filename id is the authoritative id for
+    the rollout, so prefer the last matching payload and fall back to the first
+    payload for older or non-canonical files.
+    """
+    payloads = _session_meta_payloads(path)
+    expected_session_id = session_id_from_filename(path)
+    if expected_session_id:
+        for payload in reversed(payloads):
+            payload_id = payload.get("id")
+            if isinstance(payload_id, str) and payload_id.lower() == expected_session_id.lower():
+                return payload
+    if payloads:
+        return payloads[0]
     raise ToolkitError(f"{path}: session_meta not found")
+
+
+def read_session_payload(path: Path) -> dict:
+    return select_effective_session_payload(path)
 
 
 def extract_session_field_from_file(field_name: str, session_file: Path) -> str:
@@ -260,28 +284,14 @@ def extract_session_field_from_file(field_name: str, session_file: Path) -> str:
 def extract_session_meta_fields(session_file: Path, *field_names: str) -> dict:
     result = {name: "" for name in field_names}
     try:
-        with session_file.open("r", encoding="utf-8") as fh:
-            for raw in fh:
-                stripped = raw.strip()
-                if not stripped:
-                    continue
-                try:
-                    obj = json.loads(stripped)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(obj, dict):
-                    continue
-                if obj.get("type") != "session_meta":
-                    continue
-                payload = obj.get("payload")
-                if not isinstance(payload, dict):
-                    break
-                for name in field_names:
-                    value = payload.get(name)
-                    result[name] = value if isinstance(value, str) else ""
-                break
-    except FileNotFoundError:
-        print(f"Warning: session file not found: {session_file}", file=sys.stderr)
+        payload = select_effective_session_payload(session_file)
+    except ToolkitError as exc:
+        print(f"Warning: failed to read session metadata {session_file}: {exc}", file=sys.stderr)
+        return result
+
+    for name in field_names:
+        value = payload.get(name)
+        result[name] = value if isinstance(value, str) else ""
     return result
 
 
@@ -382,32 +392,19 @@ def collect_session_ids_for_kind(
 
     for path in iter_session_files(paths, active_only=active_only):
         try:
-            with path.open("r", encoding="utf-8") as fh:
-                for raw in fh:
-                    stripped = raw.strip()
-                    if not stripped:
-                        continue
-                    obj = json.loads(stripped)
-                    if not isinstance(obj, dict):
-                        continue
-                    if obj.get("type") != "session_meta":
-                        continue
-                    payload = obj.get("payload")
-                    if not isinstance(payload, dict):
-                        break
-                    session_id = payload.get("id")
-                    source_name = payload.get("source", "")
-                    originator_name = payload.get("originator", "")
-                    if (
-                        isinstance(session_id, str)
-                        and session_id
-                        and classify_session_kind(source_name, originator_name) == session_kind
-                        and session_id not in seen_session_ids
-                    ):
-                        session_ids.append(session_id)
-                        seen_session_ids.add(session_id)
-                    break
-        except (OSError, json.JSONDecodeError) as exc:
+            payload = select_effective_session_payload(path)
+            session_id = payload.get("id")
+            source_name = payload.get("source", "")
+            originator_name = payload.get("originator", "")
+            if (
+                isinstance(session_id, str)
+                and session_id
+                and classify_session_kind(source_name, originator_name) == session_kind
+                and session_id not in seen_session_ids
+            ):
+                session_ids.append(session_id)
+                seen_session_ids.add(session_id)
+        except (OSError, json.JSONDecodeError, ToolkitError) as exc:
             print(f"Warning: failed to read session file {path}: {exc}", file=sys.stderr)
             continue
 
