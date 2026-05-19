@@ -266,10 +266,18 @@ def print_repair_result(result: RepairResult) -> int:
     print(f"Desktop session files retagged: {result.desktop_retagged}")
     print(f"CLI session files converted: {result.cli_converted}")
     print(f"Skipped invalid session files: {len(result.skipped_sessions)}")
+    print(f"Missing workspace directories created: {len(result.created_workspace_dirs)}")
     print(f"Workspace roots active after repair: {result.workspace_roots_count}")
     print(f"Desktop thread rows upserted: {result.threads_updated}")
     if result.backup_root is not None:
         print(f"Backup directory: {result.backup_root}")
+
+    if result.created_workspace_dirs:
+        print("Created workspace directories:")
+        for path_str in result.created_workspace_dirs[:20]:
+            print(path_str)
+        if len(result.created_workspace_dirs) > 20:
+            print(f"... and {len(result.created_workspace_dirs) - 20} more")
 
     if result.changed_sessions:
         print("Changed session files:")

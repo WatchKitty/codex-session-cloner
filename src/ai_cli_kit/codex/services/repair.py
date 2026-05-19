@@ -31,7 +31,6 @@ from ..support import (
     iso_to_epoch,
     lock_path_for,
     long_path,
-    nearest_existing_parent,
     normalize_iso,
     prune_old_backups,
 )
@@ -47,6 +46,14 @@ def _sqlite_value(value: Any) -> Any:
     if isinstance(value, (dict, list, tuple)):
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     return str(value)
+
+
+def _strip_windows_long_path_prefix(value: str) -> str:
+    if value.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + value[len("\\\\?\\UNC\\"):]
+    if value.startswith("\\\\?\\"):
+        return value[len("\\\\?\\"):]
+    return value
 
 
 def repair_desktop(
@@ -75,6 +82,7 @@ def repair_desktop(
     changed_sessions: list[str] = []
     skipped_sessions: list[str] = []
     workspace_candidates: "OrderedDict[str, bool]" = OrderedDict()
+    created_workspace_dirs: list[str] = []
     desktop_retagged = 0
     cli_converted = 0
 
@@ -96,7 +104,7 @@ def repair_desktop(
             timestamp = obj.get("timestamp")
             if isinstance(timestamp, str) and timestamp:
                 last_timestamp = timestamp
-            if obj.get("type") == "session_meta" and isinstance(obj.get("payload"), dict):
+            if obj.get("type") == "session_meta" and session_meta is None and isinstance(obj.get("payload"), dict):
                 session_meta = dict(obj["payload"])
             elif obj.get("type") == "turn_context" and not turn_context and isinstance(obj.get("payload"), dict):
                 turn_context = dict(obj["payload"])
@@ -167,7 +175,9 @@ def repair_desktop(
             or existing_index.get(session_id, {}).get("updated_at")
             or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         )
-        cwd = session_meta.get("cwd", "") if isinstance(session_meta.get("cwd", ""), str) else ""
+        cwd = _strip_windows_long_path_prefix(
+            session_meta.get("cwd", "") if isinstance(session_meta.get("cwd", ""), str) else ""
+        )
         preview_title = build_session_preview(history_first_messages.get(session_id, ""), session_file, cwd)
         existing_thread_name = existing_index.get(session_id, {}).get("thread_name", "")
         thread_name = (
@@ -176,7 +186,7 @@ def repair_desktop(
             else existing_thread_name or preview_title or session_id
         )
         if cwd:
-            candidate = nearest_existing_parent(cwd) or cwd
+            candidate = cwd
             if candidate and candidate not in workspace_candidates:
                 workspace_candidates[candidate] = True
 
@@ -206,6 +216,22 @@ def repair_desktop(
     entries.sort(key=lambda item: (iso_to_epoch(item["updated_at"]), item["id"]), reverse=True)
 
     if not dry_run:
+        for entry in entries:
+            if entry["kind"] != "desktop" or entry["archived"]:
+                continue
+            cwd = entry["cwd"]
+            if not cwd:
+                continue
+            workspace_dir = Path(cwd)
+            if workspace_dir.exists():
+                continue
+            try:
+                workspace_dir.mkdir(parents=True, exist_ok=True)
+                created_workspace_dirs.append(cwd)
+            except OSError as exc:
+                warnings.append(f"Warning: failed to create missing workspace directory {cwd}: {exc}")
+
+    if not dry_run:
         backup_file(paths.code_dir, backup_root, backed_up, paths.index_file, enabled=True)
         # Serialise against concurrent upsert/remove on session_index.jsonl.
         with atomic_write(paths.index_file, lock_path=lock_path_for(paths.index_file)) as fh:
@@ -231,32 +257,20 @@ def repair_desktop(
         saved_roots = list(state_data.get("electron-saved-workspace-roots", []))
         project_order = list(state_data.get("project-order", []))
 
-        # On case-insensitive filesystems (Windows NTFS, macOS APFS-default)
-        # `relative_to` is a string compare and would treat `C:\Users\Foo`
-        # vs `c:\users\foo` as distinct, allowing duplicate workspace entries
-        # to accumulate. Compare under normcase so case-only variants dedupe.
-        def _is_subpath_ci(child: Path, parent: Path) -> bool:
-            try:
-                child_norm = Path(os.path.normcase(str(child)))
-                parent_norm = Path(os.path.normcase(str(parent)))
-                child_norm.relative_to(parent_norm)
-                return True
-            except ValueError:
-                return False
-
         normcased_existing = {os.path.normcase(item) for item in saved_roots}
         normcased_order = {os.path.normcase(item) for item in project_order}
         for root in workspace_candidates:
             root_path = Path(root)
-            covered = any(
-                _is_subpath_ci(root_path, Path(existing)) for existing in saved_roots
-            )
-            if not covered:
+            root_key = os.path.normcase(str(root_path))
+            # Repair must restore the exact session cwd as a Desktop project root.
+            # A broad parent root can leave the thread hidden from the intended
+            # project after the user removes/re-adds folders in Codex Desktop.
+            if root_key not in normcased_existing:
                 saved_roots.append(root)
-                normcased_existing.add(os.path.normcase(root))
-                if os.path.normcase(root) not in normcased_order:
+                normcased_existing.add(root_key)
+                if root_key not in normcased_order:
                     project_order.append(root)
-                    normcased_order.add(os.path.normcase(root))
+                    normcased_order.add(root_key)
 
         if not dry_run:
             state_data["electron-saved-workspace-roots"] = saved_roots
@@ -336,4 +350,5 @@ def repair_desktop(
         backup_root=(None if dry_run else backup_root),
         changed_sessions=changed_sessions,
         warnings=warnings,
+        created_workspace_dirs=created_workspace_dirs,
     )

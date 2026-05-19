@@ -187,3 +187,4 @@ class RepairResult:
     backup_root: Optional[Path]
     changed_sessions: List[str]
     warnings: List[str]
+    created_workspace_dirs: List[str] = field(default_factory=list)
