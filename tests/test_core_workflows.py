@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -24,7 +25,7 @@ from ai_cli_kit.codex.services.dedupe import dedupe_clones  # noqa: E402
 from ai_cli_kit.codex.services.exporting import export_active_desktop_all, export_session  # noqa: E402
 from ai_cli_kit.codex.services.importing import import_desktop_all, import_session  # noqa: E402
 from ai_cli_kit.codex.services.repair import repair_desktop  # noqa: E402
-from ai_cli_kit.codex.support import machine_label_to_key  # noqa: E402
+from ai_cli_kit.codex.support import lock_path_for, machine_label_to_key  # noqa: E402
 from ai_cli_kit.codex.stores.bundles import collect_known_bundle_summaries, latest_distinct_bundle_summaries  # noqa: E402
 from ai_cli_kit.codex.stores.index import load_existing_index, upsert_session_index  # noqa: E402
 from ai_cli_kit.codex.stores.session_files import iter_session_files, read_session_payload  # noqa: E402
@@ -523,6 +524,61 @@ class CoreWorkflowTests(unittest.TestCase):
             finally:
                 conn.close()
             self.assertEqual(count, 1)
+
+    def test_clean_archived_unlinks_rollout_under_per_file_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir()
+            paths = CodexPaths(home=home, cwd=workspace)
+
+            archived_id = "abababab-abab-abab-abab-abababababab"
+            archived_file = write_session(
+                home,
+                archived_id,
+                provider="openai",
+                source="vscode",
+                originator="Codex Desktop",
+                cwd=workspace,
+                archived=True,
+            )
+            expected_lock = lock_path_for(archived_file)
+            held_locks: list[Path] = []
+            seen_locks: list[Path] = []
+            real_unlink = Path.unlink
+
+            @contextmanager
+            def recording_file_lock(lock_file: Path):
+                seen_locks.append(lock_file)
+                held_locks.append(lock_file)
+                try:
+                    yield
+                finally:
+                    held_locks.pop()
+
+            def checked_unlink(path: Path, *args, **kwargs):
+                if Path(path) == archived_file:
+                    self.assertEqual(
+                        held_locks,
+                        [expected_lock],
+                        "archived rollout unlink must happen while holding its per-rollout file_lock",
+                    )
+                return real_unlink(path, *args, **kwargs)
+
+            with (
+                patch(
+                    "ai_cli_kit.codex.services.archive_cleanup.file_lock",
+                    side_effect=recording_file_lock,
+                    create=True,
+                ),
+                patch.object(Path, "unlink", checked_unlink),
+            ):
+                result = clean_archived_sessions(paths, dry_run=False)
+
+            self.assertEqual(result.errors, [])
+            self.assertEqual(seen_locks, [expected_lock])
+            self.assertIn(archived_file, result.deleted_files)
+            self.assertFalse(archived_file.exists())
 
     def test_clean_archived_deletes_files_and_prunes_desktop_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
