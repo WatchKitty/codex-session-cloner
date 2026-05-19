@@ -95,10 +95,28 @@ python -m ai_cli_kit.claude
 ./aik codex import <session_id>        # 导入 Bundle
 ./aik codex clone-provider             # 切换 provider 后克隆
 ./aik codex clean-archived --dry-run   # 预览清理已归档对话
-./aik codex clean-archived --yes       # 备份后清理已归档对话
+./aik codex clean-archived --yes       # 清理已归档对话及其 Desktop 元数据
 ./aik codex repair-desktop             # 修复 Desktop 可见性 / 索引
 ./aik codex --help                     # 完整子命令清单
 ```
+
+#### `clean-archived` 清理范围
+
+`clean-archived` 面向 Codex Desktop 已归档对话，适合在侧边栏归档列表已经不再需要保留时释放本地会话数据。建议先退出 Codex Desktop，再执行 dry-run：
+
+```bash
+./aik codex clean-archived --dry-run
+./aik codex clean-archived --yes
+```
+
+执行时会删除：
+
+- `~/.codex/archived_sessions/` 下的归档 rollout JSONL 与对应 `.lock` 文件
+- `~/.codex/session_index.jsonl` 中这些归档 session id 的索引项
+- 最新 `~/.codex/state_*.sqlite` 中这些归档线程的 Desktop 元数据行（包括 `threads`、`thread_dynamic_tools` 等相关表）
+- `.codex-global-state.json` 中这些线程对应的 workspace hints、prompt-history、heartbeat 权限等残留
+
+注意：`clean-archived` 不创建备份，也没有 restore 子命令；真实删除必须显式传 `--yes`。如果某个 session id 同时仍存在于 `~/.codex/sessions/`，工具只删除归档目录里的残留文件，不清理 active 线程的 index / sqlite / global state 元数据。
 
 兼容写法：把 `./aik codex` 换成 `./codex-session-toolkit` 即可，参数完全一致。
 

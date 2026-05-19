@@ -5,14 +5,13 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import closing
-from datetime import datetime, timezone
 from pathlib import Path
 
 from ..models import ArchivedCleanupResult
 from ..paths import CodexPaths
 from ..stores.index import remove_session_index_entries
 from ..stores.session_files import read_session_payload, session_id_from_filename
-from ..support import atomic_write, backup_file, lock_path_for, long_path, prune_old_backups
+from ..support import atomic_write, lock_path_for, long_path
 
 
 def _archived_rollout_files(paths: CodexPaths) -> list[Path]:
@@ -212,22 +211,11 @@ def clean_archived_sessions(paths: CodexPaths, *, dry_run: bool = False) -> Arch
             warnings=warnings,
         )
 
-    backup_parent = paths.code_dir / "repair_backups"
-    prune_old_backups(backup_parent, keep_last=20)
-    backup_root = backup_parent / f"clean-archived-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
-    backed_up: set[str] = set()
-
-    for important_path in (paths.index_file, paths.state_file, paths.latest_state_db()):
-        if important_path is not None:
-            backup_file(paths.code_dir, backup_root, backed_up, important_path, enabled=True)
-
     deleted_files: list[Path] = []
     deleted_lock_files: list[Path] = []
     for session_file in archived_files:
         try:
             lock_file = lock_path_for(session_file)
-            backup_file(paths.code_dir, backup_root, backed_up, session_file, enabled=True)
-            backup_file(paths.code_dir, backup_root, backed_up, lock_file, enabled=True)
             session_file.unlink()
             deleted_files.append(session_file)
             if lock_file.exists():
@@ -255,7 +243,6 @@ def clean_archived_sessions(paths: CodexPaths, *, dry_run: bool = False) -> Arch
         deleted_lock_files=deleted_lock_files,
         threads_deleted=threads_deleted,
         global_state_pruned=global_state_pruned,
-        backup_root=backup_root,
         errors=errors,
         warnings=warnings,
     )

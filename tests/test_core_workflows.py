@@ -597,9 +597,7 @@ class CoreWorkflowTests(unittest.TestCase):
             self.assertTrue(active_file.exists())
             self.assertIn(archived_file, result.deleted_files)
             self.assertIn(lock_file, result.deleted_lock_files)
-            self.assertIsNotNone(result.backup_root)
-            self.assertTrue((result.backup_root / archived_file.relative_to(paths.code_dir)).exists())
-            self.assertTrue((result.backup_root / paths.index_file.relative_to(paths.code_dir)).exists())
+            self.assertFalse((paths.code_dir / "repair_backups").exists())
             self.assertNotIn(archived_id, load_existing_index(paths.index_file))
             self.assertIn(active_id, load_existing_index(paths.index_file))
 

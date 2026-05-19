@@ -66,7 +66,7 @@ def create_arg_parser() -> argparse.ArgumentParser:
         epilog=(
             "Canonical toolkit commands:\n"
             "  clone-provider        Clone active sessions to the current provider\n"
-            "  clean-archived        Delete archived Codex threads with backup\n"
+            "  clean-archived        Delete archived Codex threads and metadata\n"
             "  clean-clones          Remove legacy unmarked clone files\n"
             "  dedupe-clones         Remove duplicate clone/original pairs conservatively\n"
             "  list                  Browse local sessions\n"

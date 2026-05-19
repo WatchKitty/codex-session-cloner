@@ -153,14 +153,12 @@ def print_archived_cleanup_result(result: ArchivedCleanupResult) -> int:
     if len(result.archived_files) > 30:
         print(f"... and {len(result.archived_files) - 30} more")
 
-    if result.backup_root is not None:
-        print(f"Backup directory: {result.backup_root}")
     if result.deleted_session_ids:
         print(f"Deleted session ids: {len(result.deleted_session_ids)}")
     if result.deleted_lock_files:
         print(f"Deleted lock files: {len(result.deleted_lock_files)}")
     if result.threads_deleted:
-        print(f"SQLite rows deleted: {result.threads_deleted}")
+        print(f"SQLite metadata rows deleted: {result.threads_deleted}")
     print(f"Global state pruned: {'yes' if result.global_state_pruned else 'no'}")
     if result.warnings:
         print("Warnings:", file=sys.stderr)

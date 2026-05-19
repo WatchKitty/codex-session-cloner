@@ -93,7 +93,6 @@ class ArchivedCleanupResult:
     deleted_lock_files: List[Path] = field(default_factory=list)
     threads_deleted: int = 0
     global_state_pruned: bool = False
-    backup_root: Optional[Path] = None
     errors: List[Tuple[Path, str]] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
 

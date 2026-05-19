@@ -116,7 +116,7 @@ TUI_ACTION_NOTES = {
     "clone_dry": ["只预览将创建哪些 clone，不写入任何文件。"],
     "clean": ["删除早期版本生成、但没有 cloned_from 标记的旧副本。", "执行前需要输入 DELETE 二次确认。"],
     "clean_dry": ["只预览哪些旧副本会被删除。"],
-    "clean_archived": ["删除已归档的 Codex 线程，并同步清理 index / threads / global state。", "执行前会备份并需要输入 DELETE 二次确认。"],
+    "clean_archived": ["删除已归档的 Codex 线程，并同步清理 index / threads / global state。", "不会创建备份；建议先 dry-run，执行前需要输入 DELETE 二次确认。"],
     "clean_archived_dry": ["只预览哪些归档线程会被删除。"],
     "list_sessions": ["内置会话浏览器，支持搜索、预览和详情查看。"],
     "browse_bundles": ["独立浏览 Bundle 导出记录，而不是只在导入时顺手选择。", "默认显示全部历史，支持按导出方式、机器和最新视图切换。"],
