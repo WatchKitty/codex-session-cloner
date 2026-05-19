@@ -24,6 +24,11 @@ from ai_cli_kit.core.tui.screen_mode import (
 from ai_cli_kit.claude.tui.terminal import app_logo_lines, display_width, render_box
 
 
+def _path_text(value: object) -> str:
+    """Return path text with stable separators for cross-platform assertions."""
+    return str(value).replace("\\", "/")
+
+
 class CleanupWorkflowTests(unittest.TestCase):
     def test_safe_plan_marks_session_targets_unselected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1069,7 +1074,7 @@ class NfcNormalizeTests(unittest.TestCase):
         nfd_dir = unicodedata.normalize("NFD", "/srv/é-data")
         paths = resolve_default_paths(Path("/tmp/home"), env={"CLAUDE_CONFIG_DIR": nfd_dir})
         self.assertEqual(
-            str(paths.claude_dir),
+            _path_text(paths.claude_dir),
             unicodedata.normalize("NFC", nfd_dir),
         )
 
@@ -1082,10 +1087,9 @@ class NfcNormalizeTests(unittest.TestCase):
         nfd_dir = unicodedata.normalize("NFD", "/srv/中文-data")
         paths = resolve_default_paths(Path("/tmp/home"), env={"CLAUDE_CONFIG_DIR": nfd_dir})
         names = _enumerate_keychain_service_names(paths)
-        # Hash MUST match cc's: sha256(NFC(claude_dir))[:8]
-        expected_dirhash = sha256(
-            unicodedata.normalize("NFC", nfd_dir).encode("utf-8")
-        ).hexdigest()[:8]
+        # Hash MUST match cc's: sha256(NFC(claude_dir))[:8]. Use the
+        # resolved path string so separators stay platform-native.
+        expected_dirhash = sha256(str(paths.claude_dir).encode("utf-8")).hexdigest()[:8]
         # At least one service name should embed the dirHash suffix.
         self.assertTrue(
             any(expected_dirhash in name for name in names),
@@ -1146,7 +1150,7 @@ class AutoMemoryOverrideTests(unittest.TestCase):
                 encoding="utf-8",
             )
             resolved = resolve_auto_memory_override(paths, env={"CLAUDE_COWORK_MEMORY_PATH_OVERRIDE": "/from/env"})
-            self.assertEqual(str(resolved), "/from/env")
+            self.assertEqual(_path_text(resolved), "/from/env")
 
     def test_settings_used_when_env_unset(self) -> None:
         from ai_cli_kit.claude.services import resolve_auto_memory_override
@@ -1160,7 +1164,7 @@ class AutoMemoryOverrideTests(unittest.TestCase):
                 encoding="utf-8",
             )
             resolved = resolve_auto_memory_override(paths, env={})
-            self.assertEqual(str(resolved), "/from/settings")
+            self.assertEqual(_path_text(resolved), "/from/settings")
 
     def test_invalid_paths_rejected(self) -> None:
         from ai_cli_kit.claude.services import _validate_memory_path
@@ -1179,7 +1183,7 @@ class AutoMemoryOverrideTests(unittest.TestCase):
         # Valid absolute path accepted.
         result = _validate_memory_path("/some/where", expand_tilde=False)
         self.assertIsNotNone(result)
-        self.assertTrue(str(result).startswith("/some/where"))
+        self.assertTrue(_path_text(result).startswith("/some/where"))
 
     def test_dynamic_target_always_present_inapplicable_without_override(self) -> None:
         from unittest.mock import patch
@@ -1211,7 +1215,7 @@ class AutoMemoryOverrideTests(unittest.TestCase):
             ):
                 plan = build_plan(paths, {"auto_memory_override"})
                 item = next(p for p in plan if p.target.key == "auto_memory_override")
-                self.assertEqual(item.target.target_path, "/elsewhere/memory")
+                self.assertEqual(_path_text(item.target.target_path), "/elsewhere/memory")
 
             # With REJECTED override: target shows distinct warning.
             with patch(
@@ -2198,9 +2202,9 @@ class R8Pass1RegressionTests(unittest.TestCase):
                     "XDG_STATE_HOME": "/srv/state",
                 },
             )
-            self.assertEqual(str(paths.xdg_data_claude), "/srv/share/claude")
-            self.assertEqual(str(paths.xdg_cache_claude), "/srv/cache/claude")
-            self.assertEqual(str(paths.xdg_state_claude), "/srv/state/claude")
+            self.assertEqual(_path_text(paths.xdg_data_claude), "/srv/share/claude")
+            self.assertEqual(_path_text(paths.xdg_cache_claude), "/srv/cache/claude")
+            self.assertEqual(_path_text(paths.xdg_state_claude), "/srv/state/claude")
 
     def test_xdg_paths_default_to_home_subdirs(self) -> None:
         from ai_cli_kit.claude.paths import resolve_default_paths
@@ -2352,7 +2356,7 @@ class R10AutoMemoryFallthroughTests(unittest.TestCase):
             )
             # Must NOT report rejected — settings provides a valid override.
             self.assertIsNotNone(state.valid_path)
-            self.assertIn("/srv/memories", str(state.valid_path))
+            self.assertIn("/srv/memories", _path_text(state.valid_path))
 
     def test_invalid_env_invalid_settings_reports_env_rejection(self) -> None:
         from ai_cli_kit.claude.services import resolve_auto_memory_override_state
@@ -2400,7 +2404,7 @@ class R10OverlappingXdgAnchorsTests(unittest.TestCase):
             # ``cache/claude/x.txt`` (anchored at /srv).
             cache_file = paths.xdg_cache_claude / "x.txt"  # /srv/cache/claude/x.txt
             relative = _relative_under_anchors(paths, cache_file)
-            self.assertEqual(str(relative), "claude/x.txt")
+            self.assertEqual(_path_text(relative), "claude/x.txt")
 
 
 class R9DebugPathsTriStateTests(unittest.TestCase):
