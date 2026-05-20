@@ -144,14 +144,22 @@ def print_archived_cleanup_result(result: ArchivedCleanupResult) -> int:
     print(f"Dry run: {'yes' if result.dry_run else 'no'}")
     print(f"Archived rollout files found: {len(result.archived_files)}")
     print(f"Archived thread ids found: {len(result.archived_thread_ids)}")
+    if result.subagent_files:
+        print(f"Subagent rollout files owned by archived threads: {len(result.subagent_files)}")
 
     for target_path in result.archived_files[:30]:
         action_prefix = "[DRY-RUN] Would delete" if result.dry_run else "[Deleted]"
         if result.dry_run or target_path in result.deleted_files:
             print(f"{action_prefix} {target_path}")
+    for target_path in result.subagent_files[:30]:
+        action_prefix = "[DRY-RUN] Would delete subagent" if result.dry_run else "[Deleted subagent]"
+        if result.dry_run or target_path in result.deleted_files:
+            print(f"{action_prefix} {target_path}")
 
     if len(result.archived_files) > 30:
         print(f"... and {len(result.archived_files) - 30} more")
+    if len(result.subagent_files) > 30:
+        print(f"... and {len(result.subagent_files) - 30} more subagent files")
 
     if result.deleted_session_ids:
         print(f"Deleted session ids: {len(result.deleted_session_ids)}")
@@ -266,10 +274,18 @@ def print_repair_result(result: RepairResult) -> int:
     print(f"Desktop session files retagged: {result.desktop_retagged}")
     print(f"CLI session files converted: {result.cli_converted}")
     print(f"Skipped invalid session files: {len(result.skipped_sessions)}")
+    print(f"Missing workspace directories created: {len(result.created_workspace_dirs)}")
     print(f"Workspace roots active after repair: {result.workspace_roots_count}")
     print(f"Desktop thread rows upserted: {result.threads_updated}")
     if result.backup_root is not None:
         print(f"Backup directory: {result.backup_root}")
+
+    if result.created_workspace_dirs:
+        print("Created workspace directories:")
+        for path_str in result.created_workspace_dirs[:20]:
+            print(path_str)
+        if len(result.created_workspace_dirs) > 20:
+            print(f"... and {len(result.created_workspace_dirs) - 20} more")
 
     if result.changed_sessions:
         print("Changed session files:")

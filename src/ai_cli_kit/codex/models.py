@@ -88,6 +88,7 @@ class ArchivedCleanupResult:
     files_checked: int
     archived_files: List[Path]
     archived_thread_ids: List[str]
+    subagent_files: List[Path] = field(default_factory=list)
     deleted_session_ids: List[str] = field(default_factory=list)
     deleted_files: List[Path] = field(default_factory=list)
     deleted_lock_files: List[Path] = field(default_factory=list)
@@ -187,3 +188,4 @@ class RepairResult:
     backup_root: Optional[Path]
     changed_sessions: List[str]
     warnings: List[str]
+    created_workspace_dirs: List[str] = field(default_factory=list)

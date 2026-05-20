@@ -23,15 +23,22 @@ def _archived_rollout_files(paths: CodexPaths) -> list[Path]:
         return []
 
 
-def _active_session_ids(paths: CodexPaths) -> set[str]:
+def _active_rollout_files(paths: CodexPaths) -> list[Path]:
     if not paths.sessions_dir.exists():
-        return set()
-    session_ids: set[str] = set()
+        return []
     try:
-        session_files = sorted(paths.sessions_dir.rglob("rollout-*.jsonl"))
+        return sorted(paths.sessions_dir.rglob("rollout-*.jsonl"))
     except OSError:
-        return session_ids
-    for session_file in session_files:
+        return []
+
+
+def _all_rollout_files(paths: CodexPaths) -> list[Path]:
+    return _active_rollout_files(paths) + _archived_rollout_files(paths)
+
+
+def _active_session_ids(paths: CodexPaths) -> set[str]:
+    session_ids: set[str] = set()
+    for session_file in _active_rollout_files(paths):
         session_id = session_id_from_filename(session_file)
         if session_id:
             session_ids.add(session_id)
@@ -45,6 +52,68 @@ def _session_id_for_archived_file(path: Path) -> str:
     payload = read_session_payload(path)
     value = payload.get("id")
     return value if isinstance(value, str) else ""
+
+
+def _subagent_parent_thread_id(payload: dict) -> str:
+    source = payload.get("source")
+    if not isinstance(source, dict):
+        return ""
+
+    subagent = source.get("subagent")
+    if not isinstance(subagent, dict):
+        return ""
+
+    spawn = subagent.get("thread_spawn")
+    if isinstance(spawn, dict):
+        parent_id = spawn.get("parent_thread_id")
+        if isinstance(parent_id, str) and parent_id:
+            return parent_id
+
+    parent_id = subagent.get("parent_thread_id")
+    return parent_id if isinstance(parent_id, str) else ""
+
+
+def _session_id_and_subagent_parent(path: Path) -> tuple[str, str]:
+    session_id = session_id_from_filename(path) or ""
+    payload = read_session_payload(path)
+    if not session_id:
+        value = payload.get("id")
+        session_id = value if isinstance(value, str) else ""
+    return session_id, _subagent_parent_thread_id(payload)
+
+
+def _subagent_descendants_for_parents(paths: CodexPaths, parent_ids: set[str]) -> tuple[set[str], list[Path], list[str]]:
+    if not parent_ids:
+        return set(), [], []
+
+    warnings: list[str] = []
+    children_by_parent: dict[str, list[tuple[str, Path]]] = {}
+    for session_file in _all_rollout_files(paths):
+        try:
+            session_id, parent_id = _session_id_and_subagent_parent(session_file)
+        except Exception as exc:
+            warnings.append(f"failed to inspect subagent metadata in {session_file}: {exc}")
+            continue
+        if not session_id or not parent_id:
+            continue
+        children_by_parent.setdefault(parent_id, []).append((session_id, session_file))
+
+    child_ids: set[str] = set()
+    child_files: list[Path] = []
+    child_file_paths: set[Path] = set()
+    queue = list(parent_ids)
+    while queue:
+        parent_id = queue.pop(0)
+        for child_id, child_file in children_by_parent.get(parent_id, []):
+            if child_id in child_ids:
+                continue
+            child_ids.add(child_id)
+            queue.append(child_id)
+            if child_file not in child_file_paths:
+                child_files.append(child_file)
+                child_file_paths.add(child_file)
+
+    return child_ids, child_files, warnings
 
 
 def _archived_thread_ids_from_db(state_db: Path | None) -> tuple[list[str], list[str]]:
@@ -92,8 +161,8 @@ def _delete_archived_threads(state_db: Path | None, session_ids: set[str]) -> tu
             total = 0
             row = cur.execute("select name from sqlite_master where type='table' and name='threads'").fetchone()
             if row:
-                before = cur.execute(f"select count(*) from threads where id in ({placeholders}) and archived = 1", params).fetchone()[0]
-                cur.execute(f"delete from threads where id in ({placeholders}) and archived = 1", params)
+                before = cur.execute(f"select count(*) from threads where id in ({placeholders})", params).fetchone()[0]
+                cur.execute(f"delete from threads where id in ({placeholders})", params)
                 total += int(before or 0)
 
             total += _delete_rows_by_thread_id(cur, "thread_dynamic_tools", "thread_id", session_ids)
@@ -195,25 +264,33 @@ def clean_archived_sessions(paths: CodexPaths, *, dry_run: bool = False) -> Arch
             file_session_ids.append(session_id)
 
     active_ids = _active_session_ids(paths)
-    metadata_session_ids = (set(file_session_ids) | set(archived_thread_ids)) - active_ids
-    skipped_active_ids = sorted((set(file_session_ids) | set(archived_thread_ids)) & active_ids)
+    root_session_ids = set(file_session_ids) | set(archived_thread_ids)
+    cleanup_root_ids = root_session_ids - active_ids
+    subagent_session_ids, subagent_files, subagent_warnings = _subagent_descendants_for_parents(paths, cleanup_root_ids)
+    warnings.extend(subagent_warnings)
+
+    archived_file_paths = set(archived_files)
+    subagent_files = [path for path in subagent_files if path not in archived_file_paths]
+    metadata_session_ids = cleanup_root_ids | subagent_session_ids
+    skipped_active_ids = sorted(root_session_ids & active_ids)
     if skipped_active_ids:
         warnings.append(
             "skipped metadata cleanup for active session id(s) also present under sessions/: "
             + ", ".join(skipped_active_ids[:10])
         )
-    if dry_run or (not archived_files and not metadata_session_ids):
+    if dry_run or (not archived_files and not subagent_files and not metadata_session_ids):
         return ArchivedCleanupResult(
             dry_run=dry_run,
             files_checked=len(archived_files),
             archived_files=archived_files,
             archived_thread_ids=sorted(metadata_session_ids),
+            subagent_files=subagent_files,
             warnings=warnings,
         )
 
     deleted_files: list[Path] = []
     deleted_lock_files: list[Path] = []
-    for session_file in archived_files:
+    for session_file in archived_files + subagent_files:
         # Hold the per-rollout file_lock across unlink so a concurrent
         # Codex Desktop / toolkit writer cannot race the deletion (matches
         # the r3 convention established for import_session).
@@ -246,6 +323,7 @@ def clean_archived_sessions(paths: CodexPaths, *, dry_run: bool = False) -> Arch
         files_checked=len(archived_files),
         archived_files=archived_files,
         archived_thread_ids=deleted_session_ids,
+        subagent_files=subagent_files,
         deleted_session_ids=deleted_session_ids,
         deleted_files=deleted_files,
         deleted_lock_files=deleted_lock_files,

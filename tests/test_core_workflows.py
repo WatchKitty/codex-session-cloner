@@ -623,6 +623,135 @@ class CoreWorkflowTests(unittest.TestCase):
             self.assertFalse(any(archived_id in key for key in atom_state.keys()))
             self.assertIn(active_id, atom_state["prompt-history"])
 
+    def test_clean_archived_deletes_subagents_owned_by_archived_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir()
+            paths = CodexPaths(home=home, cwd=workspace)
+            write_config(home, "openai")
+            state_db = create_threads_db(home)
+
+            parent_id = "11111111-1111-1111-1111-111111111111"
+            child_id = "22222222-2222-2222-2222-222222222222"
+            grandchild_id = "33333333-3333-3333-3333-333333333333"
+            unrelated_id = "44444444-4444-4444-4444-444444444444"
+            parent_file = write_session(
+                home,
+                parent_id,
+                provider="openai",
+                source="vscode",
+                originator="Codex Desktop",
+                cwd=workspace,
+                archived=True,
+            )
+            child_file = write_session(
+                home,
+                child_id,
+                provider="openai",
+                source={"subagent": {"thread_spawn": {"parent_thread_id": parent_id, "agent_role": "explorer"}}},
+                originator="Codex Desktop",
+                cwd=workspace,
+            )
+            grandchild_file = write_session(
+                home,
+                grandchild_id,
+                provider="openai",
+                source={"subagent": {"thread_spawn": {"parent_thread_id": child_id, "agent_role": "worker"}}},
+                originator="Codex Desktop",
+                cwd=workspace,
+            )
+            unrelated_file = write_session(
+                home,
+                unrelated_id,
+                provider="openai",
+                source="vscode",
+                originator="Codex Desktop",
+                cwd=workspace,
+            )
+
+            for session_id, rollout_path, archived in [
+                (parent_id, parent_file, True),
+                (child_id, child_file, False),
+                (grandchild_id, grandchild_file, False),
+                (unrelated_id, unrelated_file, False),
+            ]:
+                insert_thread_row(state_db, session_id, rollout_path, archived=archived, cwd=workspace)
+                upsert_session_index(paths.index_file, session_id, session_id, "2026-04-10T10:00:00Z")
+
+            paths.state_file.write_text(
+                json.dumps(
+                    {
+                        "thread-workspace-root-hints": {
+                            parent_id: "gone",
+                            child_id: "gone",
+                            grandchild_id: "gone",
+                            unrelated_id: "keep",
+                        },
+                        "projectless-thread-ids": [parent_id, child_id, grandchild_id, unrelated_id],
+                        "electron-persisted-atom-state": {
+                            "prompt-history": {
+                                parent_id: ["gone"],
+                                child_id: ["gone"],
+                                grandchild_id: ["gone"],
+                                unrelated_id: ["keep"],
+                                "new-conversation": [],
+                            },
+                            "heartbeat-thread-permissions-by-id": {
+                                parent_id: {},
+                                child_id: {},
+                                grandchild_id: {},
+                                unrelated_id: {},
+                            },
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
+
+            result = clean_archived_sessions(paths, dry_run=False)
+
+            self.assertFalse(parent_file.exists())
+            self.assertFalse(child_file.exists())
+            self.assertFalse(grandchild_file.exists())
+            self.assertTrue(unrelated_file.exists())
+            self.assertEqual(set(result.deleted_session_ids), {parent_id, child_id, grandchild_id})
+            self.assertEqual(set(result.subagent_files), {child_file, grandchild_file})
+
+            index_entries = load_existing_index(paths.index_file)
+            self.assertNotIn(parent_id, index_entries)
+            self.assertNotIn(child_id, index_entries)
+            self.assertNotIn(grandchild_id, index_entries)
+            self.assertIn(unrelated_id, index_entries)
+
+            conn = sqlite3.connect(state_db)
+            try:
+                deleted_count = conn.execute(
+                    "select count(*) from threads where id in (?, ?, ?)",
+                    (parent_id, child_id, grandchild_id),
+                ).fetchone()[0]
+                unrelated_count = conn.execute(
+                    "select count(*) from threads where id = ?",
+                    (unrelated_id,),
+                ).fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(deleted_count, 0)
+            self.assertEqual(unrelated_count, 1)
+
+            state = json.loads(paths.state_file.read_text(encoding="utf-8"))
+            self.assertNotIn(parent_id, state["thread-workspace-root-hints"])
+            self.assertNotIn(child_id, state["thread-workspace-root-hints"])
+            self.assertNotIn(grandchild_id, state["thread-workspace-root-hints"])
+            self.assertIn(unrelated_id, state["thread-workspace-root-hints"])
+            self.assertNotIn(child_id, state["projectless-thread-ids"])
+            atom_state = state["electron-persisted-atom-state"]
+            self.assertNotIn(parent_id, atom_state["prompt-history"])
+            self.assertNotIn(child_id, atom_state["prompt-history"])
+            self.assertNotIn(grandchild_id, atom_state["prompt-history"])
+            self.assertIn(unrelated_id, atom_state["prompt-history"])
+
     def test_clean_archived_keeps_metadata_for_matching_active_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir) / "home"
@@ -1315,6 +1444,203 @@ class CoreWorkflowTests(unittest.TestCase):
             state_data = json.loads((home / ".codex" / ".codex-global-state.json").read_text(encoding="utf-8"))
             self.assertIn(str(desktop_cwd), state_data["electron-saved-workspace-roots"])
             self.assertIn(str(cli_cwd), state_data["electron-saved-workspace-roots"])
+
+    def test_repair_desktop_adds_exact_project_root_even_when_parent_root_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            home = Path(tmpdir) / "home"
+            workspace.mkdir()
+            write_config(home, "target-provider")
+            write_state_file(home)
+            create_threads_db(home)
+
+            project_cwd = workspace / "codex-session-cloner"
+            project_cwd.mkdir()
+            session_id = "45454545-4545-4545-4545-454545454545"
+            write_session(
+                home,
+                session_id,
+                provider="target-provider",
+                source="vscode",
+                originator="Codex Desktop",
+                cwd=project_cwd,
+            )
+
+            state_file = home / ".codex" / ".codex-global-state.json"
+            state_data = json.loads(state_file.read_text(encoding="utf-8"))
+            state_data["electron-saved-workspace-roots"] = [str(workspace)]
+            state_data["active-workspace-roots"] = [str(workspace)]
+            state_data["project-order"] = [str(workspace)]
+            state_file.write_text(json.dumps(state_data, separators=(",", ":")), encoding="utf-8")
+
+            paths = CodexPaths(home=home)
+            result = repair_desktop(paths)
+
+            self.assertEqual(result.threads_updated, 1)
+            repaired_state = json.loads(state_file.read_text(encoding="utf-8"))
+            self.assertIn(str(workspace), repaired_state["electron-saved-workspace-roots"])
+            self.assertIn(str(project_cwd), repaired_state["electron-saved-workspace-roots"])
+            self.assertIn(str(project_cwd), repaired_state["active-workspace-roots"])
+            self.assertIn(str(project_cwd), repaired_state["project-order"])
+
+    def test_repair_desktop_uses_rollout_authoritative_session_meta_when_rollout_embeds_parent_meta(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            home = Path(tmpdir) / "home"
+            workspace.mkdir()
+            write_config(home, "target-provider")
+            write_state_file(home)
+            create_threads_db(home)
+
+            child_cwd = workspace / "child-project"
+            child_cwd.mkdir()
+            child_id = "46464646-4646-4646-4646-464646464646"
+            parent_id = "47474747-4747-4747-4747-474747474747"
+            rollout = write_session(
+                home,
+                child_id,
+                provider="target-provider",
+                source="vscode",
+                originator="Codex Desktop",
+                cwd=child_cwd,
+                user_message="child thread prompt",
+            )
+            with rollout.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(
+                        {
+                            "timestamp": "2026-04-10T10:07:00Z",
+                            "type": "session_meta",
+                            "payload": {
+                                "id": parent_id,
+                                "model_provider": "target-provider",
+                                "source": "vscode",
+                                "originator": "Codex Desktop",
+                                "cwd": str(workspace / "parent-project"),
+                                "timestamp": "2026-04-09T10:00:00Z",
+                            },
+                        },
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
+
+            paths = CodexPaths(home=home)
+            result = repair_desktop(paths)
+
+            self.assertEqual(result.threads_updated, 1)
+            index_ids = [
+                json.loads(line)["id"]
+                for line in (home / ".codex" / "session_index.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(index_ids.count(child_id), 1)
+            self.assertNotIn(parent_id, index_ids)
+
+            conn = sqlite3.connect(home / ".codex" / "state_0001.sqlite")
+            try:
+                child_count = conn.execute("select count(*) from threads where id = ?", (child_id,)).fetchone()[0]
+                parent_count = conn.execute("select count(*) from threads where id = ?", (parent_id,)).fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(child_count, 1)
+            self.assertEqual(parent_count, 0)
+
+    def test_repair_desktop_strips_windows_long_path_prefix_from_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            home = Path(tmpdir) / "home"
+            workspace.mkdir()
+            write_config(home, "target-provider")
+            write_state_file(home)
+            create_threads_db(home)
+
+            project_cwd = workspace / "long-path-project"
+            project_cwd.mkdir()
+            session_id = "48484848-4848-4848-4848-484848484848"
+            write_session(
+                home,
+                session_id,
+                provider="target-provider",
+                source="vscode",
+                originator="Codex Desktop",
+                cwd=Path("\\\\?\\" + str(project_cwd)),
+            )
+
+            paths = CodexPaths(home=home)
+            result = repair_desktop(paths)
+
+            self.assertEqual(result.threads_updated, 1)
+            state_data = json.loads((home / ".codex" / ".codex-global-state.json").read_text(encoding="utf-8"))
+            self.assertIn(str(project_cwd), state_data["electron-saved-workspace-roots"])
+            self.assertNotIn("\\\\?\\" + str(project_cwd), state_data["electron-saved-workspace-roots"])
+
+            conn = sqlite3.connect(home / ".codex" / "state_0001.sqlite")
+            try:
+                row = conn.execute("select cwd from threads where id = ?", (session_id,)).fetchone()
+            finally:
+                conn.close()
+            self.assertEqual(row, (str(project_cwd),))
+
+    def test_repair_desktop_creates_missing_active_desktop_workspace_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            home = Path(tmpdir) / "home"
+            workspace.mkdir()
+            write_config(home, "target-provider")
+            write_state_file(home)
+            create_threads_db(home)
+
+            missing_cwd = workspace / "deleted-project"
+            session_id = "49494949-4949-4949-4949-494949494949"
+            write_session(
+                home,
+                session_id,
+                provider="target-provider",
+                source="vscode",
+                originator="Codex Desktop",
+                cwd=missing_cwd,
+            )
+
+            paths = CodexPaths(home=home)
+            result = repair_desktop(paths)
+
+            self.assertTrue(missing_cwd.is_dir())
+            self.assertEqual(result.created_workspace_dirs, [str(missing_cwd)])
+            state_data = json.loads((home / ".codex" / ".codex-global-state.json").read_text(encoding="utf-8"))
+            self.assertIn(str(missing_cwd), state_data["electron-saved-workspace-roots"])
+
+            conn = sqlite3.connect(home / ".codex" / "state_0001.sqlite")
+            try:
+                row = conn.execute("select cwd from threads where id = ?", (session_id,)).fetchone()
+            finally:
+                conn.close()
+            self.assertEqual(row, (str(missing_cwd),))
+
+    def test_repair_desktop_dry_run_does_not_create_missing_workspace_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            home = Path(tmpdir) / "home"
+            workspace.mkdir()
+            write_config(home, "target-provider")
+            write_state_file(home)
+            create_threads_db(home)
+
+            missing_cwd = workspace / "dry-run-project"
+            session_id = "50505050-5050-5050-5050-505050505050"
+            write_session(
+                home,
+                session_id,
+                provider="target-provider",
+                source="vscode",
+                originator="Codex Desktop",
+                cwd=missing_cwd,
+            )
+
+            paths = CodexPaths(home=home)
+            result = repair_desktop(paths, dry_run=True)
+
+            self.assertFalse(missing_cwd.exists())
+            self.assertEqual(result.created_workspace_dirs, [])
 
     def test_repair_desktop_uses_session_preview_when_thread_name_is_uuid_placeholder(self) -> None:
         tmpdir = tempfile.mkdtemp()
